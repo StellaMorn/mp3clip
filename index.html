@@ -63,6 +63,11 @@ body.vol-abs .rel-only, body:not(.vol-abs) .abs-only { display: none; }
 #cover-prev { width: 140px; height: 140px; flex: none; border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
   display: flex; align-items: center; justify-content: center; overflow: hidden; color: var(--muted); font-size: 12px; text-align: center; }
 #cover-prev canvas, #cover-prev img { max-width: 100%; max-height: 100%; display: block; }
+#crop { display: none; margin-bottom: 12px; }
+#crop-stage { position: relative; margin: 0 auto; overflow: hidden; border-radius: 6px; background: #000;
+  touch-action: none; user-select: none; cursor: crosshair; }
+#crop-stage canvas { display: block; }
+#crop-box { position: absolute; outline: 2px solid #fff; box-shadow: 0 0 0 9999px rgba(0,0,0,.55); cursor: move; }
 
 #result a { color: var(--accent); }
 </style>
@@ -122,6 +127,15 @@ body.vol-abs .rel-only, body:not(.vol-abs) .abs-only { display: none; }
 
       <section>
         <h2>ジャケットとタグ</h2>
+        <div id="crop">
+          <div id="crop-stage"><div id="crop-box"></div></div>
+          <div class="row" style="margin-top:6px;flex-wrap:nowrap">
+            <span class="muted" style="flex:none">大きさ</span>
+            <input id="crop-size" type="range" min="20" max="100" step="1" value="100">
+            <button id="crop-center" style="flex:none">中央に</button>
+          </div>
+          <div class="muted">枠をドラッグで移動、ホイールで大きさを変えられます。</div>
+        </div>
         <div id="cover-box">
           <div id="cover-prev">「このフレームを<br>ジャケットに」<br>で選ぶ</div>
           <div style="display:grid;gap:4px">
@@ -198,7 +212,8 @@ drop.addEventListener('dragleave', () => drop.classList.remove('over'));
 drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); e.dataTransfer.files[0] && open(e.dataTransfer.files[0]); });
 
 function open(file) {
-  st.file = file; st.id = null; st.coverTime = null; st.coverJpeg = null; st.fallback = false;
+  st.file = file; st.id = null; st.coverTime = null; st.coverSrc = null; st.fallback = false;
+  $('crop').style.display = 'none';
   st.loudKey = null; st.loud = null; renderLoud();
   $('result').textContent = ''; $('status').textContent = '';
   $('title').value = file.name.replace(/\.[^.]+$/, '');
@@ -250,7 +265,7 @@ function upload(file) {
     let r = {}; try { r = JSON.parse(xhr.responseText); } catch {}
     if (xhr.status !== 200) { $('up-label').innerHTML = `<span class="err">${esc(r.error || 'アップロード失敗')}</span>`; return; }
     if (file !== st.file) return;   // 途中で別ファイルに替えた
-    st.id = r.id; st.hasVideo = r.hasVideo;
+    st.id = r.id; st.hasVideo = r.hasVideo; st.vw = r.width;
     $('up-label').textContent = `${file.name} — ${fmt(r.duration)}${r.hasVideo ? `　${r.width}×${r.height}` : '　映像なし'}`;
     $('up-pct').textContent = '';
     if (!st.duration || Math.abs(st.duration - r.duration) > 1) initRange(r.duration);
@@ -389,53 +404,129 @@ applyGain();
 video.addEventListener('play', () => { ensureAudioGraph(); if (actx && actx.state === 'suspended') actx.resume(); });
 
 // ---------- ジャケット
+// 選んだフレームを原寸の canvas（st.coverSrc）に丸ごと持っておき、切り抜きはすべてブラウザでやる。
+// 表示中のフレームを使うのは、サーバの ffmpeg -ss だと1コマずれるため
+const clampN = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+// 切り抜き枠：中心（幅・高さに対する割合）と一辺（短辺に対する割合）。フレームを選び直しても保つ
+st.crop = { fx: 0.5, fy: 0.5, fs: 1 };
+const cropBox = $('crop-box'), stage = $('crop-stage'), thumb = document.createElement('canvas');
+
 async function pickCover() {
   if (!st.hasVideo) return;
   // シーク直後はまだ前のフレームが描かれているので、描き終わるまで待つ
   if (!st.fallback && video.seeking) await new Promise(ok => video.addEventListener('seeked', ok, { once: true }));
-  st.coverTime = cur();
-  $('cover-t').textContent = `${fmt(st.coverTime)} のフレーム`;
+  const t = cur();
+  const src = document.createElement('canvas');
+  if (!st.fallback && video.videoWidth) {
+    src.width = video.videoWidth; src.height = video.videoHeight;
+    src.getContext('2d').drawImage(video, 0, 0);
+  } else if (st.id) {
+    // ブラウザで再生できない形式：サーバで切り出したフレームを使う
+    const img = new Image();
+    img.src = `api/frame?id=${st.id}&t=${t.toFixed(2)}&w=${Math.min(st.vw || 1280, 1600)}`;
+    try { await img.decode(); } catch { return; }
+    src.width = img.naturalWidth; src.height = img.naturalHeight;
+    src.getContext('2d').drawImage(img, 0, 0);
+  } else return;
+  st.coverSrc = src; st.coverTime = t;
+  stage.replaceChildren(src, cropBox);
+  $('cover-t').textContent = `${fmt(t)} のフレーム`;
   $('use-cover').checked = true;
   renderCover();
   syncRange();
 }
-function renderCover() {
-  const box = $('cover-prev');
-  if (st.coverTime == null) return;
-  const sq = $('square').checked;
-  st.coverJpeg = null;
-  if (!st.fallback && video.videoWidth) {
-    // 表示中のフレームをそのままジャケットにする（長辺 1200 まで）。サーバの ffmpeg だと1コマずれる
-    const vw = video.videoWidth, vh = video.videoHeight;
-    const s = Math.min(vw, vh);
-    const sx = sq ? (vw - s) / 2 : 0, sy = sq ? (vh - s) / 2 : 0, sw = sq ? s : vw, sh = sq ? s : vh;
-    const c = document.createElement('canvas');
-    const scale = Math.min(1, 1200 / Math.max(sw, sh));
-    c.width = Math.round(sw * scale); c.height = Math.round(sh * scale);
-    c.getContext('2d').drawImage(video, sx, sy, sw, sh, 0, 0, c.width, c.height);
-    st.coverJpeg = c.toDataURL('image/jpeg', 0.92);
-    const img = new Image(); img.src = st.coverJpeg;
-    box.replaceChildren(img);
-  } else if (st.id) {
-    const img = new Image();
-    img.src = `api/frame?id=${st.id}&t=${st.coverTime.toFixed(2)}&w=280${sq ? '&square=1' : ''}`;
-    box.replaceChildren(img);
-  }
+
+// 原寸での切り抜き範囲
+function cropRect() {
+  const w = st.coverSrc.width, h = st.coverSrc.height;
+  const s = Math.round(Math.min(w, h) * st.crop.fs);
+  const x = Math.round(clampN(st.crop.fx * w - s / 2, 0, w - s));
+  const y = Math.round(clampN(st.crop.fy * h - s / 2, 0, h - s));
+  return { x, y, s };
 }
-$('b-cover').onclick = pickCover;
-$('square').addEventListener('change', () => {
-  // 正方形の切り替えはその時刻に戻して描き直す
-  if (st.coverTime == null) return;
-  if (!st.fallback && video.videoWidth) {
-    const back = video.currentTime;
-    video.currentTime = st.coverTime;
-    video.addEventListener('seeked', function once() { video.removeEventListener('seeked', once); renderCover(); video.currentTime = back; });
-  } else renderCover();
+// 端に当たったら中心をそこで止める（はみ出した分を溜めない）
+function settleCrop() {
+  const r = cropRect(), w = st.coverSrc.width, h = st.coverSrc.height;
+  st.crop.fx = (r.x + r.s / 2) / w; st.crop.fy = (r.y + r.s / 2) / h;
+}
+
+function renderCover() {
+  const src = st.coverSrc, sq = $('square').checked;
+  $('crop').style.display = src && sq ? 'block' : 'none';
+  if (!src) return;
+  let x = 0, y = 0, sw = src.width, sh = src.height;
+  if (sq) {
+    const r = cropRect();
+    x = r.x; y = r.y; sw = sh = r.s;
+    // 枠の編集面：横幅いっぱい、ただし縦長の動画で画面からはみ出さないよう高さも抑える
+    const k = Math.min($('crop').clientWidth / src.width, Math.max(160, innerHeight * 0.45) / src.height);
+    st.cropK = k;
+    src.style.width = src.width * k + 'px'; src.style.height = src.height * k + 'px';
+    stage.style.width = src.width * k + 'px';
+    Object.assign(cropBox.style, { left: r.x * k + 'px', top: r.y * k + 'px', width: r.s * k + 'px', height: r.s * k + 'px' });
+    $('crop-size').value = Math.round(st.crop.fs * 100);
+  }
+  // 出来上がりの見本（高解像度画面でもにじまないよう 280px で描く）
+  const sc = 280 / Math.max(sw, sh);
+  thumb.width = Math.round(sw * sc); thumb.height = Math.round(sh * sc);
+  thumb.getContext('2d').drawImage(src, x, y, sw, sh, 0, 0, thumb.width, thumb.height);
+  if ($('cover-prev').firstChild !== thumb) $('cover-prev').replaceChildren(thumb);
+}
+
+// 書き出し用 JPEG（長辺 1200 まで）。フレーム未選択なら null（サーバが開始位置のフレームを使う）
+function coverJpeg() {
+  const src = st.coverSrc;
+  if (!src) return null;
+  let x = 0, y = 0, sw = src.width, sh = src.height;
+  if ($('square').checked) { const r = cropRect(); x = r.x; y = r.y; sw = sh = r.s; }
+  const sc = Math.min(1, 1200 / Math.max(sw, sh));
+  const c = document.createElement('canvas');
+  c.width = Math.round(sw * sc); c.height = Math.round(sh * sc);
+  c.getContext('2d').drawImage(src, x, y, sw, sh, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.92);
+}
+
+// 枠の操作：枠をつかんで移動。枠の外を押すとそこへ枠の中心を移してそのままドラッグ
+let drag = null;
+stage.addEventListener('pointerdown', e => {
+  if (!st.coverSrc) return;
+  stage.setPointerCapture(e.pointerId);
+  const b = stage.getBoundingClientRect(), k = st.cropK, r = cropRect();
+  const px = (e.clientX - b.left) / k, py = (e.clientY - b.top) / k;
+  if (px < r.x || px > r.x + r.s || py < r.y || py > r.y + r.s) {
+    st.crop.fx = px / st.coverSrc.width; st.crop.fy = py / st.coverSrc.height;
+    settleCrop(); renderCover();
+  }
+  drag = { x0: e.clientX, y0: e.clientY, fx: st.crop.fx, fy: st.crop.fy };
 });
+stage.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const k = st.cropK;
+  st.crop.fx = drag.fx + (e.clientX - drag.x0) / k / st.coverSrc.width;
+  st.crop.fy = drag.fy + (e.clientY - drag.y0) / k / st.coverSrc.height;
+  settleCrop(); renderCover();
+});
+for (const ev of ['pointerup', 'pointercancel']) stage.addEventListener(ev, () => { drag = null; });
+stage.addEventListener('wheel', e => {
+  if (!st.coverSrc) return;
+  e.preventDefault();
+  st.crop.fs = clampN(st.crop.fs * (e.deltaY < 0 ? 1.05 : 1 / 1.05), 0.2, 1);
+  settleCrop(); renderCover();
+}, { passive: false });
+$('crop-size').addEventListener('input', () => {
+  if (!st.coverSrc) return;
+  st.crop.fs = Number($('crop-size').value) / 100;
+  settleCrop(); renderCover();
+});
+$('crop-center').onclick = () => { st.crop.fx = st.crop.fy = 0.5; if (st.coverSrc) { settleCrop(); renderCover(); } };
+addEventListener('resize', () => { if (st.coverSrc) renderCover(); });
+
+$('b-cover').onclick = pickCover;
+$('square').addEventListener('change', renderCover);
 
 // ---------- キーボード
 document.addEventListener('keydown', e => {
-  if (!st.file || e.target.matches('input[type=text], input[type=number], select')) return;
+  if (!st.file || e.target.matches('input[type=text], input[type=number], input[type=range], select')) return;
   const k = e.key.toLowerCase();
   if (k === 'i') setIn();
   else if (k === 'o') setOut();
@@ -462,7 +553,7 @@ $('b-export').onclick = async () => {
     fadeIn: Number($('fadein').value) || 0, fadeOut: Number($('fadeout').value) || 0,
     cover: $('use-cover').checked && st.hasVideo,
     coverTime: st.coverTime == null ? st.start : st.coverTime, square: $('square').checked,
-    coverJpeg: st.coverTime == null ? null : st.coverJpeg,
+    coverJpeg: coverJpeg(),
     title: $('title').value, artist: $('artist').value, album: $('album').value,
     bitrate: Number($('bitrate').value),
   };
