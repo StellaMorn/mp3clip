@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mp3clip</title>
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #fff; --text: #1d1d1b; --muted: #6b6b66; --line: #deded8;
+  --accent: #2f6fdb; --accent-text: #fff; --sel: rgba(47,111,219,.25); --cover: #e08a1e; --err: #c0392b;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #161615; --panel: #1f1f1d; --text: #ececea; --muted: #9a9a94; --line: #34342f;
+    --accent: #5b8ff0; --sel: rgba(91,143,240,.3); --cover: #f0a040; --err: #ef6b5b; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.6 system-ui, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif; }
+main { max-width: 980px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 20px; margin: 4px 0 12px; }
+h1 small { color: var(--muted); font-weight: normal; font-size: 13px; margin-left: 8px; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
+button, select, input { font: inherit; color: inherit; }
+button { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 6px 12px; cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; padding: 9px 22px; }
+input[type=text], input[type=number], select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; min-width: 0; }
+kbd { font-size: 11px; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: var(--muted); margin-left: 4px; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.muted { color: var(--muted); font-size: 13px; }
+.err { color: var(--err); }
+
+#drop { border: 2px dashed var(--line); border-radius: 10px; padding: 28px 16px; text-align: center; cursor: pointer; }
+#drop.over { border-color: var(--accent); background: var(--sel); }
+#drop input { display: none; }
+
+.bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+
+#player { display: none; }
+.stage { background: #000; border-radius: 8px; overflow: hidden; display: flex; justify-content: center; }
+.stage video, .stage img { max-width: 100%; max-height: 52vh; display: block; }
+#timeline { position: relative; height: 34px; margin: 10px 0 4px; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; cursor: pointer; touch-action: none; user-select: none; }
+#tl-sel { position: absolute; top: 0; bottom: 0; background: var(--sel); border-left: 2px solid var(--accent); border-right: 2px solid var(--accent); }
+#tl-head { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); }
+#tl-cover { position: absolute; top: -7px; width: 0; height: 0; border: 6px solid transparent; border-top-color: var(--cover); transform: translateX(-6px); display: none; }
+.times { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+.field { display: grid; grid-template-columns: 6.5em 1fr; gap: 6px 10px; align-items: center; }
+.field label { color: var(--muted); font-size: 13px; }
+.time-in { width: 7.5em; font-variant-numeric: tabular-nums; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+
+#cover-box { display: flex; gap: 12px; align-items: flex-start; }
+#cover-prev { width: 140px; height: 140px; flex: none; border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
+  display: flex; align-items: center; justify-content: center; overflow: hidden; color: var(--muted); font-size: 12px; text-align: center; }
+#cover-prev canvas, #cover-prev img { max-width: 100%; max-height: 100%; display: block; }
+
+#result a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>mp3clip <small>動画 → MP3（時間・音量・ジャケット）</small></h1>
+
+  <section id="pick">
+    <label id="drop">
+      <input id="file" type="file" accept="video/*,audio/*,.mkv,.avi,.wmv,.flv,.ts,.m2ts,.mov,.webm">
+      <div><b>動画をドロップ</b> またはクリックして選択</div>
+      <div class="muted" id="pick-note">mp4 / mkv / webm / mov など。ffmpeg が読めれば何でも可</div>
+    </label>
+    <div id="up" style="display:none;margin-top:10px">
+      <div class="row muted" style="justify-content:space-between"><span id="up-label">アップロード中…</span><span id="up-pct"></span></div>
+      <div class="bar"><div id="up-bar"></div></div>
+    </div>
+  </section>
+
+  <div id="player">
+    <section>
+      <div class="stage">
+        <video id="video" controls playsinline preload="auto"></video>
+        <img id="still" alt="" style="display:none">
+      </div>
+      <div id="fallback-note" class="muted" style="display:none;margin-top:6px">
+        このブラウザでは再生できない形式なので、コマ送りプレビューにしています（音は聞けません）。
+      </div>
+      <div id="timeline"><div id="tl-sel"></div><div id="tl-cover" title="ジャケット"></div><div id="tl-head"></div></div>
+      <div class="times muted"><span id="t-cur">0:00.0</span><span id="t-len">0:00.0</span></div>
+      <div class="row" style="margin-top:8px">
+        <button id="b-in">ここを開始に<kbd>I</kbd></button>
+        <button id="b-out">ここを終了に<kbd>O</kbd></button>
+        <button id="b-play">範囲を再生<kbd>P</kbd></button>
+        <button id="b-cover">このフレームをジャケットに<kbd>C</kbd></button>
+        <span class="muted" style="margin-left:auto">←→ 1秒 / Shift 0.1秒</span>
+      </div>
+    </section>
+
+    <div class="grid">
+      <section>
+        <h2>範囲と音量</h2>
+        <div class="field">
+          <label>開始</label><div class="row"><input id="start" class="time-in" type="text"><button id="go-start">移動</button></div>
+          <label>終了</label><div class="row"><input id="end" class="time-in" type="text"><button id="go-end">移動</button></div>
+          <label>長さ</label><div id="len" class="muted"></div>
+          <label>音量</label><div class="row" style="flex-wrap:nowrap"><input id="gain" type="range" min="-20" max="20" step="0.5" value="0"><span id="gain-v" style="width:5em;text-align:right;font-variant-numeric:tabular-nums">0 dB</span></div>
+          <label></label><label class="row" style="gap:6px;color:inherit;font-size:14px"><input id="loudnorm" type="checkbox">音量を自動でそろえる（-14 LUFS）</label>
+          <label>フェード</label><div class="row">イン <input id="fadein" type="number" min="0" step="0.5" value="0" style="width:4.5em">秒　アウト <input id="fadeout" type="number" min="0" step="0.5" value="0" style="width:4.5em">秒</div>
+        </div>
+        <div class="muted" style="margin-top:8px">音量スライダーは再生中の音にも反映されます（自動そろえは出力時のみ）。</div>
+      </section>
+
+      <section>
+        <h2>ジャケットとタグ</h2>
+        <div id="cover-box">
+          <div id="cover-prev">「このフレームを<br>ジャケットに」<br>で選ぶ</div>
+          <div style="display:grid;gap:4px">
+            <label class="row" style="gap:6px"><input id="use-cover" type="checkbox" checked>ジャケットを付ける</label>
+            <label class="row" style="gap:6px"><input id="square" type="checkbox" checked>正方形に切り抜く</label>
+            <span class="muted" id="cover-t">未選択なら開始位置のフレーム</span>
+          </div>
+        </div>
+        <div class="field" style="margin-top:12px">
+          <label>タイトル</label><input id="title" type="text">
+          <label>アーティスト</label><input id="artist" type="text">
+          <label>アルバム</label><input id="album" type="text">
+          <label>音質</label><select id="bitrate"><option>128</option><option>160</option><option selected>192</option><option>256</option><option>320</option></select>
+        </div>
+      </section>
+    </div>
+
+    <section>
+      <div class="row">
+        <button id="b-export" class="primary" disabled>MP3 を作る</button>
+        <span id="status" class="muted"></span>
+      </div>
+      <div class="bar" id="ex-barwrap" style="display:none;margin-top:10px"><div id="ex-bar"></div></div>
+      <div id="result" style="margin-top:8px"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const video = $('video'), still = $('still');
+
+const st = {
+  file: null, id: null, duration: 0, hasVideo: true,
+  start: 0, end: 0, coverTime: null, fallback: false, t: 0,
+  stopAt: null,
+};
+
+// ---------- 時刻表記
+function fmt(s) {
+  s = Math.max(0, s || 0);
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = (s % 60).toFixed(1).padStart(4, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+}
+function parse(str) {
+  const parts = String(str).trim().split(':').map(Number);
+  if (!parts.length || parts.some(n => !isFinite(n))) return null;
+  return parts.reduce((a, n) => a * 60 + n, 0);
+}
+
+// ---------- 記憶（アーティスト・アルバム・音質）
+const KEEP = ['artist', 'album', 'bitrate', 'square', 'loudnorm'];
+function loadPrefs() {
+  try {
+    const p = JSON.parse(localStorage.getItem('mp3clip') || '{}');
+    for (const k of KEEP) if (k in p) { const el = $(k); el.type === 'checkbox' ? el.checked = p[k] : el.value = p[k]; }
+  } catch {}
+}
+function savePrefs() {
+  try {
+    const p = {};
+    for (const k of KEEP) { const el = $(k); p[k] = el.type === 'checkbox' ? el.checked : el.value; }
+    localStorage.setItem('mp3clip', JSON.stringify(p));
+  } catch {}
+}
+loadPrefs();
+
+// ---------- ファイル選択
+const drop = $('drop');
+$('file').addEventListener('change', e => e.target.files[0] && open(e.target.files[0]));
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); e.dataTransfer.files[0] && open(e.dataTransfer.files[0]); });
+
+function open(file) {
+  st.file = file; st.id = null; st.coverTime = null; st.coverJpeg = null; st.fallback = false;
+  $('result').textContent = ''; $('status').textContent = '';
+  $('title').value = file.name.replace(/\.[^.]+$/, '');
+  $('cover-prev').innerHTML = '「このフレームを<br>ジャケットに」<br>で選ぶ';
+  $('cover-t').textContent = '未選択なら開始位置のフレーム';
+  $('player').style.display = 'block';
+  still.style.display = 'none'; video.style.display = 'block'; $('fallback-note').style.display = 'none';
+  $('b-export').disabled = true;
+  if (video.src) URL.revokeObjectURL(video.src);
+  video.src = URL.createObjectURL(file);   // プレビューは手元のファイルで即座に。アップロードは裏で
+  upload(file);
+}
+
+video.addEventListener('loadedmetadata', () => { if (!st.id) initRange(video.duration); });
+video.addEventListener('error', () => { if (st.file) enterFallback(); });
+
+function initRange(d) {
+  st.duration = d; st.start = 0; st.end = d;
+  $('t-len').textContent = fmt(d);
+  syncRange();
+}
+
+// ブラウザが再生できない形式（mkv の一部や avi など）→ サーバのフレームでコマ送り
+function enterFallback() {
+  if (st.fallback) return;
+  st.fallback = true;
+  video.style.display = 'none'; still.style.display = 'block'; $('fallback-note').style.display = 'block';
+  $('b-play').disabled = true;
+  if (st.id) showStill(st.t);
+}
+let stillTimer = null;
+function showStill(t) {
+  if (!st.id || !st.hasVideo) return;
+  clearTimeout(stillTimer);
+  stillTimer = setTimeout(() => { still.src = `api/frame?id=${st.id}&t=${t.toFixed(2)}&w=960`; }, 120);
+}
+
+function upload(file) {
+  $('up').style.display = 'block'; $('up-label').textContent = 'アップロード中…'; $('up-bar').style.width = '0';
+  const xhr = new XMLHttpRequest();
+  xhr.open('PUT', 'api/upload?name=' + encodeURIComponent(file.name));
+  xhr.upload.onprogress = e => {
+    if (!e.lengthComputable) return;
+    const r = e.loaded / e.total;
+    $('up-bar').style.width = (r * 100) + '%'; $('up-pct').textContent = Math.floor(r * 100) + '%';
+    if (r >= 1) $('up-label').textContent = '解析中…';
+  };
+  xhr.onload = () => {
+    let r = {}; try { r = JSON.parse(xhr.responseText); } catch {}
+    if (xhr.status !== 200) { $('up-label').innerHTML = `<span class="err">${esc(r.error || 'アップロード失敗')}</span>`; return; }
+    if (file !== st.file) return;   // 途中で別ファイルに替えた
+    st.id = r.id; st.hasVideo = r.hasVideo;
+    $('up-label').textContent = `${file.name} — ${fmt(r.duration)}${r.hasVideo ? `　${r.width}×${r.height}` : '　映像なし'}`;
+    $('up-pct').textContent = '';
+    if (!st.duration || Math.abs(st.duration - r.duration) > 1) initRange(r.duration);
+    else st.duration = r.duration;
+    if (!r.hasVideo) { $('use-cover').checked = false; $('b-cover').disabled = true; }
+    else $('b-cover').disabled = false;
+    if (st.fallback) showStill(st.t);
+    $('b-export').disabled = false;
+  };
+  xhr.onerror = () => { $('up-label').innerHTML = '<span class="err">アップロードに失敗しました</span>'; };
+  xhr.send(file);
+}
+
+// ---------- 現在位置
+function cur() { return st.fallback ? st.t : video.currentTime; }
+function seek(t) {
+  t = Math.min(Math.max(0, t), st.duration || 0);
+  st.t = t;
+  if (st.fallback) { showStill(t); drawHead(); }
+  else video.currentTime = t;
+}
+video.addEventListener('timeupdate', () => {
+  if (st.stopAt != null && video.currentTime >= st.stopAt) { video.pause(); st.stopAt = null; }
+  drawHead();
+});
+video.addEventListener('seeked', drawHead);
+video.addEventListener('pause', () => { st.stopAt = null; });
+
+function drawHead() {
+  const d = st.duration || 1, t = cur();
+  $('tl-head').style.left = (t / d * 100) + '%';
+  $('t-cur').textContent = fmt(t);
+}
+function syncRange() {
+  const d = st.duration || 1;
+  $('start').value = fmt(st.start); $('end').value = fmt(st.end);
+  $('len').textContent = fmt(st.end - st.start);
+  $('tl-sel').style.left = (st.start / d * 100) + '%';
+  $('tl-sel').style.width = ((st.end - st.start) / d * 100) + '%';
+  const c = $('tl-cover');
+  if (st.coverTime != null) { c.style.display = 'block'; c.style.left = (st.coverTime / d * 100) + '%'; }
+  else c.style.display = 'none';
+  drawHead();
+}
+
+// タイムライン：クリック/ドラッグでシーク
+const tl = $('timeline');
+function tlSeek(e) { const r = tl.getBoundingClientRect(); seek((e.clientX - r.left) / r.width * st.duration); }
+tl.addEventListener('pointerdown', e => { tl.setPointerCapture(e.pointerId); tlSeek(e); });
+tl.addEventListener('pointermove', e => { if (e.buttons) tlSeek(e); });
+
+function setIn() { st.start = Math.min(cur(), st.end - 0.1); if (st.start < 0) st.start = 0; syncRange(); }
+function setOut() { st.end = Math.max(cur(), st.start + 0.1); if (st.end > st.duration) st.end = st.duration; syncRange(); }
+function playRange() {
+  if (st.fallback) return;
+  ensureAudioGraph();
+  video.currentTime = st.start; st.stopAt = st.end; video.play();
+}
+$('b-in').onclick = setIn; $('b-out').onclick = setOut; $('b-play').onclick = playRange;
+$('go-start').onclick = () => seek(st.start); $('go-end').onclick = () => seek(st.end);
+for (const k of ['start', 'end']) $(k).addEventListener('change', () => {
+  const v = parse($(k).value);
+  if (v != null) {
+    if (k === 'start') st.start = Math.min(Math.max(0, v), st.end - 0.1);
+    else st.end = Math.max(Math.min(st.duration, v), st.start + 0.1);
+  }
+  syncRange();
+});
+
+// ---------- 音量（再生中の音にも反映）
+let actx = null, gainNode = null;
+function ensureAudioGraph() {
+  if (actx || st.fallback) return;
+  try {
+    actx = new AudioContext();
+    gainNode = actx.createGain();
+    actx.createMediaElementSource(video).connect(gainNode).connect(actx.destination);
+    applyGain();
+  } catch { actx = null; }
+}
+function applyGain() {
+  const db = Number($('gain').value);
+  $('gain-v').textContent = (db > 0 ? '+' : '') + db + ' dB';
+  if (gainNode) gainNode.gain.value = Math.pow(10, db / 20);
+}
+$('gain').addEventListener('input', applyGain);
+video.addEventListener('play', () => { ensureAudioGraph(); if (actx && actx.state === 'suspended') actx.resume(); });
+
+// ---------- ジャケット
+async function pickCover() {
+  if (!st.hasVideo) return;
+  // シーク直後はまだ前のフレームが描かれているので、描き終わるまで待つ
+  if (!st.fallback && video.seeking) await new Promise(ok => video.addEventListener('seeked', ok, { once: true }));
+  st.coverTime = cur();
+  $('cover-t').textContent = `${fmt(st.coverTime)} のフレーム`;
+  $('use-cover').checked = true;
+  renderCover();
+  syncRange();
+}
+function renderCover() {
+  const box = $('cover-prev');
+  if (st.coverTime == null) return;
+  const sq = $('square').checked;
+  st.coverJpeg = null;
+  if (!st.fallback && video.videoWidth) {
+    // 表示中のフレームをそのままジャケットにする（長辺 1200 まで）。サーバの ffmpeg だと1コマずれる
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const s = Math.min(vw, vh);
+    const sx = sq ? (vw - s) / 2 : 0, sy = sq ? (vh - s) / 2 : 0, sw = sq ? s : vw, sh = sq ? s : vh;
+    const c = document.createElement('canvas');
+    const scale = Math.min(1, 1200 / Math.max(sw, sh));
+    c.width = Math.round(sw * scale); c.height = Math.round(sh * scale);
+    c.getContext('2d').drawImage(video, sx, sy, sw, sh, 0, 0, c.width, c.height);
+    st.coverJpeg = c.toDataURL('image/jpeg', 0.92);
+    const img = new Image(); img.src = st.coverJpeg;
+    box.replaceChildren(img);
+  } else if (st.id) {
+    const img = new Image();
+    img.src = `api/frame?id=${st.id}&t=${st.coverTime.toFixed(2)}&w=280${sq ? '&square=1' : ''}`;
+    box.replaceChildren(img);
+  }
+}
+$('b-cover').onclick = pickCover;
+$('square').addEventListener('change', () => {
+  // 正方形の切り替えはその時刻に戻して描き直す
+  if (st.coverTime == null) return;
+  if (!st.fallback && video.videoWidth) {
+    const back = video.currentTime;
+    video.currentTime = st.coverTime;
+    video.addEventListener('seeked', function once() { video.removeEventListener('seeked', once); renderCover(); video.currentTime = back; });
+  } else renderCover();
+});
+
+// ---------- キーボード
+document.addEventListener('keydown', e => {
+  if (!st.file || e.target.matches('input[type=text], input[type=number], select')) return;
+  const k = e.key.toLowerCase();
+  if (k === 'i') setIn();
+  else if (k === 'o') setOut();
+  else if (k === 'p') playRange();
+  else if (k === 'c') pickCover();
+  else if (k === 'arrowleft' || k === 'arrowright') {
+    e.preventDefault();
+    seek(cur() + (k === 'arrowleft' ? -1 : 1) * (e.shiftKey ? 0.1 : 1));
+  } else if (k === ' ' && !st.fallback && e.target !== video) {
+    e.preventDefault(); video.paused ? video.play() : video.pause();
+  } else return;
+});
+
+// ---------- 書き出し
+$('b-export').onclick = async () => {
+  if (!st.id) return;
+  savePrefs();
+  const btn = $('b-export');
+  btn.disabled = true; $('result').textContent = '';
+  $('status').textContent = '変換中…'; $('ex-barwrap').style.display = 'block'; $('ex-bar').style.width = '0';
+  const body = {
+    id: st.id, start: st.start, end: st.end,
+    gainDb: Number($('gain').value), loudnorm: $('loudnorm').checked,
+    fadeIn: Number($('fadein').value) || 0, fadeOut: Number($('fadeout').value) || 0,
+    cover: $('use-cover').checked && st.hasVideo,
+    coverTime: st.coverTime == null ? st.start : st.coverTime, square: $('square').checked,
+    coverJpeg: st.coverTime == null ? null : st.coverJpeg,
+    title: $('title').value, artist: $('artist').value, album: $('album').value,
+    bitrate: Number($('bitrate').value),
+  };
+  try {
+    const r = await (await fetch('api/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
+    if (r.error) throw new Error(r.error);
+    for (;;) {
+      await new Promise(ok => setTimeout(ok, 500));
+      const j = await (await fetch('api/job?id=' + r.job)).json();
+      if (j.error && j.state !== 'error') throw new Error(j.error);
+      $('ex-bar').style.width = (j.progress * 100) + '%';
+      $('status').textContent = `変換中… ${Math.floor(j.progress * 100)}%`;
+      if (j.state === 'error') throw new Error(j.error);
+      if (j.state === 'done') {
+        const href = 'api/download?id=' + r.job;
+        $('status').textContent = '完了';
+        $('result').innerHTML = `<a href="${href}">${esc(j.filename)}</a> <span class="muted">(${(j.size / 1048576).toFixed(1)} MB)</span>`;
+        location.href = href;   // Content-Disposition: attachment なのでページは移動しない
+        break;
+      }
+    }
+  } catch (e) {
+    $('status').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }
+</script>
+</body>
+</html>
