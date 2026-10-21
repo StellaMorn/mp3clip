@@ -56,6 +56,8 @@ kbd { font-size: 11px; border: 1px solid var(--line); border-radius: 4px; paddin
 .field label { color: var(--muted); font-size: 13px; }
 .time-in { width: 7.5em; font-variant-numeric: tabular-nums; }
 input[type=range] { width: 100%; accent-color: var(--accent); }
+.vol-v { width: 6em; flex: none; text-align: right; font-variant-numeric: tabular-nums; }
+body.vol-abs .rel-only, body:not(.vol-abs) .abs-only { display: none; }
 
 #cover-box { display: flex; gap: 12px; align-items: flex-start; }
 #cover-prev { width: 140px; height: 140px; flex: none; border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
@@ -108,11 +110,14 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
           <label>開始</label><div class="row"><input id="start" class="time-in" type="text"><button id="go-start">移動</button></div>
           <label>終了</label><div class="row"><input id="end" class="time-in" type="text"><button id="go-end">移動</button></div>
           <label>長さ</label><div id="len" class="muted"></div>
-          <label>音量</label><div class="row" style="flex-wrap:nowrap"><input id="gain" type="range" min="-20" max="20" step="0.5" value="0"><span id="gain-v" style="width:5em;text-align:right;font-variant-numeric:tabular-nums">0 dB</span></div>
-          <label></label><label class="row" style="gap:6px;color:inherit;font-size:14px"><input id="loudnorm" type="checkbox">音量を自動でそろえる（-14 LUFS）</label>
+          <label>音量</label><select id="volmode"><option value="abs">目標の音量にする（LUFS）</option><option value="rel">元の音量から増減（dB）</option></select>
+          <label class="abs-only"></label><div class="row abs-only" style="flex-wrap:nowrap"><input id="target" type="range" min="-30" max="-6" step="0.5" value="-14"><span id="target-v" class="vol-v">-14 LUFS</span></div>
+          <label class="rel-only"></label><div class="row rel-only" style="flex-wrap:nowrap"><input id="gain" type="range" min="-20" max="20" step="0.5" value="0"><span id="gain-v" class="vol-v">0 dB</span></div>
+          <label></label><div id="loud" class="muted"></div>
           <label>フェード</label><div class="row">イン <input id="fadein" type="number" min="0" step="0.5" value="0" style="width:4.5em">秒　アウト <input id="fadeout" type="number" min="0" step="0.5" value="0" style="width:4.5em">秒</div>
         </div>
-        <div class="muted" style="margin-top:8px">音量スライダーは再生中の音にも反映されます（自動そろえは出力時のみ）。</div>
+        <div class="muted" style="margin-top:8px">LUFS は耳で感じる大きさの単位。目安は -14 ≒ YouTube・Spotify、-16 ≒ Apple Music、-23 ≒ テレビ放送。
+          音量は再生中の音にも反映されます。</div>
       </section>
 
       <section>
@@ -169,7 +174,7 @@ function parse(str) {
 }
 
 // ---------- 記憶（アーティスト・アルバム・音質）
-const KEEP = ['artist', 'album', 'bitrate', 'square', 'loudnorm'];
+const KEEP = ['artist', 'album', 'bitrate', 'square', 'volmode', 'target'];
 function loadPrefs() {
   try {
     const p = JSON.parse(localStorage.getItem('mp3clip') || '{}');
@@ -194,6 +199,7 @@ drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('
 
 function open(file) {
   st.file = file; st.id = null; st.coverTime = null; st.coverJpeg = null; st.fallback = false;
+  st.loudKey = null; st.loud = null; renderLoud();
   $('result').textContent = ''; $('status').textContent = '';
   $('title').value = file.name.replace(/\.[^.]+$/, '');
   $('cover-prev').innerHTML = '「このフレームを<br>ジャケットに」<br>で選ぶ';
@@ -252,6 +258,7 @@ function upload(file) {
     if (!r.hasVideo) { $('use-cover').checked = false; $('b-cover').disabled = true; }
     else $('b-cover').disabled = false;
     if (st.fallback) showStill(st.t);
+    scheduleMeasure();
     $('b-export').disabled = false;
   };
   xhr.onerror = () => { $('up-label').innerHTML = '<span class="err">アップロードに失敗しました</span>'; };
@@ -288,6 +295,7 @@ function syncRange() {
   if (st.coverTime != null) { c.style.display = 'block'; c.style.left = (st.coverTime / d * 100) + '%'; }
   else c.style.display = 'none';
   drawHead();
+  scheduleMeasure();
 }
 
 // タイムライン：クリック/ドラッグでシーク
@@ -325,12 +333,59 @@ function ensureAudioGraph() {
     applyGain();
   } catch { actx = null; }
 }
-function applyGain() {
-  const db = Number($('gain').value);
-  $('gain-v').textContent = (db > 0 ? '+' : '') + db + ' dB';
-  if (gainNode) gainNode.gain.value = Math.pow(10, db / 20);
+const signed = (n, d = 1) => (n > 0 ? '+' : '') + n.toFixed(d);
+const absMode = () => $('volmode').value === 'abs';
+
+// 実際にかかる増減（dB）。目標モードは測定が済むまで 0
+function gainDb() {
+  if (!absMode()) return Number($('gain').value);
+  const m = st.loud;
+  return m && isFinite(m.i) ? Number($('target').value) - m.i : 0;
 }
-$('gain').addEventListener('input', applyGain);
+function applyGain() {
+  document.body.classList.toggle('vol-abs', absMode());
+  $('gain-v').textContent = signed(Number($('gain').value)) + ' dB';
+  $('target-v').textContent = Number($('target').value).toFixed(1) + ' LUFS';
+  if (gainNode) gainNode.gain.value = Math.pow(10, Math.max(-40, Math.min(40, gainDb())) / 20);
+  renderLoud();
+}
+for (const k of ['gain', 'target']) $(k).addEventListener('input', applyGain);
+$('volmode').addEventListener('change', () => { applyGain(); savePrefs(); });
+
+// 範囲のラウドネスを測る（範囲を変えるたび。少し待ってから）
+let measureTimer = null, measureSeq = 0;
+function scheduleMeasure() {
+  if (!st.id) return;
+  const key = st.start.toFixed(3) + '-' + st.end.toFixed(3);
+  if (st.loudKey === key) return;
+  st.loudKey = key; st.loud = null; renderLoud();
+  clearTimeout(measureTimer);
+  const seq = ++measureSeq;
+  measureTimer = setTimeout(async () => {
+    let r;
+    try {
+      r = await (await fetch(`api/measure?id=${st.id}&start=${st.start}&end=${st.end}`)).json();
+    } catch (e) { r = { error: e.message }; }
+    if (seq !== measureSeq) return;   // その間に範囲が変わった
+    st.loud = r;
+    applyGain();
+  }, 600);
+}
+function renderLoud() {
+  const el = $('loud'), m = st.loud;
+  if (!st.id) { el.textContent = ''; return; }
+  if (!m) { el.textContent = 'この範囲の音量を測っています…'; return; }
+  if (m.error) { el.innerHTML = `<span class="err">測れませんでした: ${esc(m.error)}</span>`; return; }
+  if (m.silent) { el.textContent = 'この範囲はほぼ無音です'; return; }
+  const g = gainDb();
+  const out = m.i + g;
+  let s = `この範囲: ${m.i.toFixed(1)} LUFS → ${absMode() ? '' : '約 '}${out.toFixed(1)} LUFS（${signed(g)} dB）`;
+  if (m.tp + g > (absMode() ? -1 : 0)) s += absMode()
+    ? '　※そのまま上げるとピークが上限（-1 dBTP）を超えるので、軽く圧縮します。差が大きいと目標まで届きません'
+    : '　※ピークが 0 dB を超えると音割れします';
+  el.textContent = s;
+}
+applyGain();
 video.addEventListener('play', () => { ensureAudioGraph(); if (actx && actx.state === 'suspended') actx.resume(); });
 
 // ---------- ジャケット
@@ -403,7 +458,7 @@ $('b-export').onclick = async () => {
   $('status').textContent = '変換中…'; $('ex-barwrap').style.display = 'block'; $('ex-bar').style.width = '0';
   const body = {
     id: st.id, start: st.start, end: st.end,
-    gainDb: Number($('gain').value), loudnorm: $('loudnorm').checked,
+    volMode: $('volmode').value, gainDb: Number($('gain').value), targetLufs: Number($('target').value),
     fadeIn: Number($('fadein').value) || 0, fadeOut: Number($('fadeout').value) || 0,
     cover: $('use-cover').checked && st.hasVideo,
     coverTime: st.coverTime == null ? st.start : st.coverTime, square: $('square').checked,
@@ -424,7 +479,14 @@ $('b-export').onclick = async () => {
       if (j.state === 'done') {
         const href = 'api/download?id=' + r.job;
         $('status').textContent = '完了';
-        $('result').innerHTML = `<a href="${href}">${esc(j.filename)}</a> <span class="muted">(${(j.size / 1048576).toFixed(1)} MB)</span>`;
+        let info = `${(j.size / 1048576).toFixed(1)} MB`;
+        let warn = '';
+        if (j.loud) {
+          info += ` / ${j.loud.i.toFixed(1)} LUFS・ピーク ${j.loud.tp.toFixed(1)} dBTP`;
+          if (body.volMode === 'abs' && j.loud.i < body.targetLufs - 1)
+            warn = `<div class="err">目標 ${body.targetLufs} LUFS に届きませんでした。ピークの大きい音なので、音割れを防ぐ処理が上げ幅を抑えています。</div>`;
+        }
+        $('result').innerHTML = `<a href="${href}">${esc(j.filename)}</a> <span class="muted">(${info})</span>${warn}`;
         location.href = href;   // Content-Disposition: attachment なのでページは移動しない
         break;
       }

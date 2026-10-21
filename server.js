@@ -44,7 +44,7 @@ cleanup();
 setInterval(cleanup, 3600e3).unref();
 
 // ---------------------------------------------------------------- ffmpeg
-function run(bin, args) {
+function run(bin, args, wantStderr = false) {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { windowsHide: true });
     const out = [], err = [];
@@ -52,7 +52,7 @@ function run(bin, args) {
     p.stderr.on('data', d => err.push(d));
     p.on('error', reject);
     p.on('close', code => {
-      if (code === 0) resolve(Buffer.concat(out));
+      if (code === 0) resolve(wantStderr ? Buffer.concat(err).toString() : Buffer.concat(out));
       else reject(new Error(lastLines(Buffer.concat(err).toString())));
     });
   });
@@ -83,9 +83,37 @@ function frameArgs(file, t, vf) {
     '-q:v', '2', '-f', 'image2pipe', '-c:v', 'mjpeg', 'pipe:1'];
 }
 
-async function exportJob(job, u, o) {
+function range(u, o) {
   const start = clamp(num(o.start, 0), 0, u.duration);
   const end = clamp(num(o.end, u.duration), start, u.duration);
+  return { start, end };
+}
+
+// ラウドネスを測る（loudnorm の1パス目の出力を読む）。無音なら null
+async function loudness(inputArgs) {
+  const stderr = await run(FFMPEG, ['-hide_banner', '-nostats', ...inputArgs,
+    '-af', 'loudnorm=print_format=json', '-f', 'null', '-'], true);
+  const m = /\{[^{}]*"input_i"[^{}]*\}/.exec(stderr);
+  if (!m) throw new Error('ラウドネスを測れませんでした');
+  const j = JSON.parse(m[0]);
+  const r = { i: Number(j.input_i), tp: Number(j.input_tp), lra: Number(j.input_lra), thresh: Number(j.input_thresh) };
+  return isFinite(r.i) && r.i > -70 ? r : null;
+}
+
+// 範囲のラウドネス。同じ範囲は使い回す
+function measure(u, start, end) {
+  const key = `${start.toFixed(3)}-${end.toFixed(3)}`;
+  u.loud = u.loud || new Map();
+  if (!u.loud.has(key)) {
+    const p = loudness(['-ss', String(start), '-i', u.file, '-t', String(end - start), '-map', '0:a:0']);
+    p.catch(() => u.loud.delete(key));
+    u.loud.set(key, p);
+  }
+  return u.loud.get(key);
+}
+
+async function exportJob(job, u, o) {
+  const { start, end } = range(u, o);
   const dur = end - start;
   if (dur < 0.1) throw new Error('範囲が短すぎます');
 
@@ -103,9 +131,18 @@ async function exportJob(job, u, o) {
   }
 
   const af = [];
-  if (o.loudnorm) af.push('loudnorm=I=-14:TP=-1:LRA=11');
-  const gain = clamp(num(o.gainDb, 0), -40, 40);
-  if (gain) af.push(`volume=${gain}dB`);
+  if (o.volMode === 'abs') {
+    // 目標ラウドネス（LUFS）。測った値を渡す2パス目は linear=true で一律の増減になる。
+    // 増やすとピークが TP を超える場合だけ、ffmpeg が自動で動的処理（軽い圧縮）に切り替える
+    const target = clamp(num(o.targetLufs, -14), -40, -5);
+    const m = await measure(u, start, end);
+    // ffmpeg 4.4 は measured_LRA=0 を「未指定」扱いして動的処理に落ちる（一定音量の音で起きる）ので 0.1 を下限にする
+    if (m) af.push(`loudnorm=I=${target}:TP=-1:LRA=20:measured_I=${m.i}:measured_TP=${m.tp}`
+      + `:measured_LRA=${Math.max(0.1, m.lra)}:measured_thresh=${m.thresh}:linear=true`, 'aresample=44100');
+  } else {
+    const gain = clamp(num(o.gainDb, 0), -40, 40);
+    if (gain) af.push(`volume=${gain}dB`);
+  }
   const fi = clamp(num(o.fadeIn, 0), 0, dur), fo = clamp(num(o.fadeOut, 0), 0, dur);
   if (fi > 0) af.push(`afade=t=in:st=0:d=${fi}`);
   if (fo > 0) af.push(`afade=t=out:st=${(dur - fo).toFixed(3)}:d=${fo}`);
@@ -138,6 +175,9 @@ async function exportJob(job, u, o) {
     p.on('close', code => code === 0 ? resolve() : reject(new Error(lastLines(Buffer.concat(err).toString()))));
   });
   if (coverFile) fs.unlink(coverFile, () => {});
+
+  // 出来上がりの音量を測って返す。目標が高すぎるとピーク制限で届かないことがあるので、実際の値を見せる
+  try { job.loud = await loudness(['-i', job.out, '-map', '0:a:0']); } catch { job.loud = null; }
 }
 
 const num = (v, d) => (v === '' || v == null || !isFinite(Number(v))) ? d : Number(v);
@@ -215,6 +255,16 @@ const server = http.createServer(async (req, res) => {
       return res.end(jpg);
     }
 
+    // 範囲のラウドネス（LUFS）。目標音量モードの表示とプレビュー用
+    if (req.method === 'GET' && p === '/api/measure') {
+      const u = getUpload(q);
+      if (!u) return fail(res, 404, 'not found');
+      const { start, end } = range(u, { start: q.get('start'), end: q.get('end') });
+      if (end - start < 0.1) return fail(res, 400, '範囲が短すぎます');
+      const m = await measure(u, start, end);
+      return send(res, 200, m ? { i: m.i, tp: m.tp, lra: m.lra } : { silent: true });
+    }
+
     // 変換は時間がかかるのでジョブにして返す（hub のプロキシタイムアウトに掛からないように）
     if (req.method === 'POST' && p === '/api/export') {
       const o = await readJson(req, 20 * 1024 * 1024);   // ジャケットの JPEG を含む
@@ -233,7 +283,8 @@ const server = http.createServer(async (req, res) => {
       const job = jobs.get(q.get('id') || '');
       if (!job) return fail(res, 404, 'not found');
       return send(res, 200, { state: job.state, progress: job.progress, error: job.error,
-        filename: job.filename, size: job.size || 0 });
+        filename: job.filename, size: job.size || 0,
+        loud: job.loud ? { i: job.loud.i, tp: job.loud.tp } : null });
     }
 
     if (req.method === 'GET' && p === '/api/download') {
