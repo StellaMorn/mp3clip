@@ -242,6 +242,13 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { id, name, ...info });
     }
 
+    // 連続処理で済んだ動画を消す（12 時間待たずに work/ を空ける）
+    if (req.method === 'DELETE' && p === '/api/upload') {
+      const u = getUpload(q);
+      if (u) { uploads.delete(u.id); fs.unlink(u.file, () => {}); }
+      return send(res, 200, { ok: true });
+    }
+
     // 指定時刻のフレーム（ブラウザで再生できない形式のときのプレビュー用）
     if (req.method === 'GET' && p === '/api/frame') {
       const u = getUpload(q);

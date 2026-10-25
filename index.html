@@ -33,9 +33,25 @@ kbd { font-size: 11px; border: 1px solid var(--line); border-radius: 4px; paddin
 .muted { color: var(--muted); font-size: 13px; }
 .err { color: var(--err); }
 
-#drop { border: 2px dashed var(--line); border-radius: 10px; padding: 28px 16px; text-align: center; cursor: pointer; }
+#drop { display: block; border: 2px dashed var(--line); border-radius: 10px; padding: 28px 16px; text-align: center; cursor: pointer; }
 #drop.over { border-color: var(--accent); background: var(--sel); }
 #drop input { display: none; }
+#drop.compact { padding: 10px 16px; }
+#drop.compact #pick-note { display: none; }
+body:not(.multi) .q-only { display: none !important; }
+
+#q-list { list-style: none; margin: 6px 0 0; padding: 0; max-height: 240px; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 8px; }
+.q-item { display: flex; gap: 8px; align-items: center; padding: 5px 10px; border-top: 1px solid var(--line);
+  cursor: pointer; font-size: 14px; }
+.q-item:first-child { border-top: 0; }
+.q-item.cur { background: var(--sel); cursor: default; }
+.q-item.done .q-name, .q-item.skip .q-name { color: var(--muted); }
+.q-mark { width: 1.2em; flex: none; text-align: center; }
+.q-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.q-info { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--muted); }
+.q-info a { color: var(--accent); }
+.q-del { flex: none; padding: 0 6px; border: 0; background: none; color: var(--muted); }
 
 .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
 .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
@@ -78,10 +94,14 @@ body.vol-abs .rel-only, body:not(.vol-abs) .abs-only { display: none; }
 
   <section id="pick">
     <label id="drop">
-      <input id="file" type="file" accept="video/*,audio/*,.mkv,.avi,.wmv,.flv,.ts,.m2ts,.mov,.webm">
-      <div><b>動画をドロップ</b> またはクリックして選択</div>
+      <input id="file" type="file" multiple accept="video/*,audio/*,.mkv,.avi,.wmv,.flv,.ts,.m2ts,.mov,.webm">
+      <div><b>動画をドロップ</b>（複数可）またはクリックして選択</div>
       <div class="muted" id="pick-note">mp4 / mkv / webm / mov など。ffmpeg が読めれば何でも可</div>
     </label>
+    <div id="queue" style="display:none;margin-top:10px">
+      <div class="muted" id="q-sum"></div>
+      <ol id="q-list"></ol>
+    </div>
     <div id="up" style="display:none;margin-top:10px">
       <div class="row muted" style="justify-content:space-between"><span id="up-label">アップロード中…</span><span id="up-pct"></span></div>
       <div class="bar"><div id="up-bar"></div></div>
@@ -157,6 +177,10 @@ body.vol-abs .rel-only, body:not(.vol-abs) .abs-only { display: none; }
       <div class="row">
         <button id="b-export" class="primary" disabled>MP3 を作る</button>
         <span id="status" class="muted"></span>
+        <span class="row q-only" style="margin-left:auto;gap:10px">
+          <label class="row" style="gap:6px"><input id="auto-next" type="checkbox" checked>作ったら次の動画へ</label>
+          <button id="b-skip">スキップ →</button>
+        </span>
       </div>
       <div class="bar" id="ex-barwrap" style="display:none;margin-top:10px"><div id="ex-bar"></div></div>
       <div id="result" style="margin-top:8px"></div>
@@ -204,27 +228,174 @@ function savePrefs() {
 }
 loadPrefs();
 
-// ---------- ファイル選択
+// ---------- 動画のリスト（連続処理）
+// 選んだファイルは参照を持つだけで中身は読まない。開くのは今の1本だけ（動画はディスクから直接再生）。
+// サーバへは「今の1本＋次の1本」だけを上げておき、済んだ動画のアップロードはすぐ消す
+const queue = [];   // { file, status: 'wait'|'done'|'skip', up, xhr, id, info, prog, err, busy, result }
+let curIdx = -1;
+
 const drop = $('drop');
-$('file').addEventListener('change', e => e.target.files[0] && open(e.target.files[0]));
+$('file').addEventListener('change', e => { addFiles(e.target.files); e.target.value = ''; });
 drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
 drop.addEventListener('dragleave', () => drop.classList.remove('over'));
-drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); e.dataTransfer.files[0] && open(e.dataTransfer.files[0]); });
+drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); addFiles(e.dataTransfer.files); });
 
-function open(file) {
-  st.file = file; st.id = null; st.coverTime = null; st.coverSrc = null; st.fallback = false;
+function addFiles(files) {
+  const first = queue.length;
+  for (const f of files) queue.push({ file: f, status: 'wait', prog: 0 });
+  if (queue.length === first) return;
+  if (curIdx < 0) openItem(first);
+  else { renderQueue(); prefetch(); }
+}
+
+// 次に作業する動画（今より後ろ → 先頭から、の順で「待ち」を探す）
+function nextWaiting() {
+  for (let k = 1; k < queue.length; k++) {
+    const i = (curIdx + k) % queue.length;
+    if (queue[i].status === 'wait') return i;
+  }
+  return -1;
+}
+
+function openItem(i) {
+  const prev = queue[curIdx], item = queue[i];
+  if (prev && prev !== item && prev.status !== 'wait') release(prev);
+  curIdx = i;
+  st.file = item.file; st.id = null; st.coverTime = null; st.coverSrc = null; st.fallback = false;
+  st.duration = 0; st.start = st.end = 0; st.t = 0; st.stopAt = null;
   $('crop').style.display = 'none';
   st.loudKey = null; st.loud = null; renderLoud();
-  $('result').textContent = ''; $('status').textContent = '';
-  $('title').value = file.name.replace(/\.[^.]+$/, '');
+  $('status').textContent = ''; $('ex-barwrap').style.display = 'none';
+  showResult(item);
+  $('title').value = item.file.name.replace(/\.[^.]+$/, '');
   $('cover-prev').innerHTML = '「このフレームを<br>ジャケットに」<br>で選ぶ';
   $('cover-t').textContent = '未選択なら開始位置のフレーム';
   $('player').style.display = 'block';
   still.style.display = 'none'; video.style.display = 'block'; $('fallback-note').style.display = 'none';
+  $('b-play').disabled = false;
   $('b-export').disabled = true;
   if (video.src) URL.revokeObjectURL(video.src);
-  video.src = URL.createObjectURL(file);   // プレビューは手元のファイルで即座に。アップロードは裏で
-  upload(file);
+  video.src = URL.createObjectURL(item.file);   // プレビューは手元のファイルで即座に。アップロードは裏で
+  if (!item.up) item.up = uploadItem(item);
+  showUp(item);
+  item.up.then(r => {
+    if (queue[curIdx] === item && st.file === item.file && !st.id) applyInfo(r);
+    prefetch();
+  }, () => {});
+  renderQueue();
+}
+
+function uploadItem(item) {
+  item.prog = 0; item.err = null;
+  return new Promise((resolve, reject) => {
+    const xhr = item.xhr = new XMLHttpRequest();
+    const fail = msg => { item.err = msg; item.up = null; tick(item); reject(new Error(msg)); };
+    xhr.open('PUT', 'api/upload?name=' + encodeURIComponent(item.file.name));
+    xhr.upload.onprogress = e => { if (e.lengthComputable) { item.prog = e.loaded / e.total; tick(item); } };
+    xhr.onload = () => {
+      let r = {}; try { r = JSON.parse(xhr.responseText); } catch {}
+      if (xhr.status !== 200) return fail(r.error || 'アップロード失敗');
+      item.id = r.id; item.info = r; item.prog = 1; tick(item); resolve(r);
+    };
+    xhr.onerror = () => fail('アップロードに失敗しました');
+    xhr.onabort = () => fail('中止しました');
+    xhr.send(item.file);
+  });
+}
+
+// 今の動画が上がったら、次の1本だけ先に上げておく（同時に上げるのは1本まで）
+function prefetch() {
+  const cur = queue[curIdx];
+  if (!cur || !cur.id) return;
+  if (queue.some(q => q.up && !q.id)) return;
+  const n = nextWaiting();
+  if (n < 0 || queue[n].up || queue[n].err) return;
+  queue[n].up = uploadItem(queue[n]);
+  queue[n].up.then(prefetch, () => {});
+}
+
+// 済んだ動画のアップロードを消す。書き出し中なら終わってから
+function release(item) {
+  if (item.busy) { item.releaseLater = true; return; }
+  if (item.xhr && !item.id) item.xhr.abort();
+  if (item.id) fetch('api/upload?id=' + item.id, { method: 'DELETE' }).catch(() => {});
+  item.id = null; item.info = null; item.up = null; item.prog = 0;
+}
+
+// ページを閉じたら上げてある動画を全部消す（戻る用にキャッシュされるだけのときは残す）
+addEventListener('pagehide', e => {
+  if (e.persisted) return;
+  for (const q of queue) if (q.id) fetch('api/upload?id=' + q.id, { method: 'DELETE', keepalive: true }).catch(() => {});
+});
+
+function removeItem(i) {
+  if (i === curIdx) return;
+  release(queue[i]);
+  queue.splice(i, 1);
+  if (i < curIdx) curIdx--;
+  renderQueue(); prefetch();
+}
+
+$('b-skip').onclick = () => {
+  const item = queue[curIdx];
+  if (!item) return;
+  if (item.status === 'wait') item.status = 'skip';
+  const n = nextWaiting();
+  if (n >= 0) openItem(n); else renderQueue();
+};
+
+// アップロードの進み具合（今の動画は上の欄、全部はリスト。リストの描き直しは1フレームに1回）
+let queueDirty = false;
+function tick(item) {
+  if (queue[curIdx] === item) showUp(item);
+  if (!queueDirty) { queueDirty = true; requestAnimationFrame(() => { queueDirty = false; renderQueue(); }); }
+}
+function showUp(item) {
+  $('up').style.display = 'block';
+  if (item.err) { $('up-label').innerHTML = `<span class="err">${esc(item.err)}</span>`; $('up-pct').textContent = ''; return; }
+  if (item.info) {
+    const r = item.info;
+    $('up-label').textContent = `${item.file.name} — ${fmt(r.duration)}${r.hasVideo ? `　${r.width}×${r.height}` : '　映像なし'}`;
+    $('up-pct').textContent = ''; $('up-bar').style.width = '100%';
+    return;
+  }
+  $('up-label').textContent = item.prog >= 1 ? '解析中…' : 'アップロード中…';
+  $('up-pct').textContent = Math.floor(item.prog * 100) + '%';
+  $('up-bar').style.width = (item.prog * 100) + '%';
+}
+
+function renderQueue() {
+  document.body.classList.toggle('multi', queue.length > 1);
+  $('queue').style.display = queue.length > 1 ? 'block' : 'none';
+  drop.classList.toggle('compact', queue.length > 0);
+  const done = queue.filter(q => q.status === 'done').length;
+  const skip = queue.filter(q => q.status === 'skip').length;
+  $('q-sum').textContent = `${queue.length} 本中 ${done} 本完了` + (skip ? `・${skip} 本スキップ` : '');
+  $('q-list').replaceChildren(...queue.map((q, i) => {
+    const li = document.createElement('li');
+    const isCur = i === curIdx;
+    li.className = `q-item ${q.status}${isCur ? ' cur' : ''}`;
+    const mark = isCur ? '▶' : q.status === 'done' ? '✓' : q.status === 'skip' ? '–' : '・';
+    let info = '';
+    if (q.status === 'done' && q.result) {
+      info = `→ <a href="${q.result.href}">${esc(q.result.filename)}</a>`
+        + (q.result.warn ? ' <span class="err" title="目標の音量に届きませんでした">⚠</span>' : '');
+    } else if (q.status === 'skip') info = 'スキップ';
+    else if (q.err) info = `<span class="err">${esc(q.err)}</span>`;
+    else if (q.up && !q.id) info = `アップロード ${Math.floor(q.prog * 100)}%`;
+    else if (q.id && !isCur) info = '準備OK';
+    li.innerHTML = `<span class="q-mark">${mark}</span><span class="q-name">${esc(q.file.name)}</span>`
+      + `<span class="q-info">${info}</span>`
+      + (isCur ? '' : '<button class="q-del" title="リストから外す">×</button>');
+    li.onclick = e => {
+      if (e.target.closest('a')) return;
+      if (e.target.closest('.q-del')) return removeItem(i);
+      if (!isCur) openItem(i);
+    };
+    return li;
+  }));
+  const c = $('q-list').children[curIdx];
+  if (c) c.scrollIntoView({ block: 'nearest' });
 }
 
 video.addEventListener('loadedmetadata', () => { if (!st.id) initRange(video.duration); });
@@ -251,33 +422,18 @@ function showStill(t) {
   stillTimer = setTimeout(() => { still.src = `api/frame?id=${st.id}&t=${t.toFixed(2)}&w=960`; }, 120);
 }
 
-function upload(file) {
-  $('up').style.display = 'block'; $('up-label').textContent = 'アップロード中…'; $('up-bar').style.width = '0';
-  const xhr = new XMLHttpRequest();
-  xhr.open('PUT', 'api/upload?name=' + encodeURIComponent(file.name));
-  xhr.upload.onprogress = e => {
-    if (!e.lengthComputable) return;
-    const r = e.loaded / e.total;
-    $('up-bar').style.width = (r * 100) + '%'; $('up-pct').textContent = Math.floor(r * 100) + '%';
-    if (r >= 1) $('up-label').textContent = '解析中…';
-  };
-  xhr.onload = () => {
-    let r = {}; try { r = JSON.parse(xhr.responseText); } catch {}
-    if (xhr.status !== 200) { $('up-label').innerHTML = `<span class="err">${esc(r.error || 'アップロード失敗')}</span>`; return; }
-    if (file !== st.file) return;   // 途中で別ファイルに替えた
-    st.id = r.id; st.hasVideo = r.hasVideo; st.vw = r.width;
-    $('up-label').textContent = `${file.name} — ${fmt(r.duration)}${r.hasVideo ? `　${r.width}×${r.height}` : '　映像なし'}`;
-    $('up-pct').textContent = '';
-    if (!st.duration || Math.abs(st.duration - r.duration) > 1) initRange(r.duration);
-    else st.duration = r.duration;
-    if (!r.hasVideo) { $('use-cover').checked = false; $('b-cover').disabled = true; }
-    else $('b-cover').disabled = false;
-    if (st.fallback) showStill(st.t);
-    scheduleMeasure();
-    $('b-export').disabled = false;
-  };
-  xhr.onerror = () => { $('up-label').innerHTML = '<span class="err">アップロードに失敗しました</span>'; };
-  xhr.send(file);
+// サーバで解析が済んだ情報を今の動画に反映する
+let wantCover = true;   // 「ジャケットを付ける」の本人の選択（映像なしの動画で外しても次で戻す）
+$('use-cover').addEventListener('change', e => { wantCover = e.target.checked; });
+function applyInfo(r) {
+  st.id = r.id; st.hasVideo = r.hasVideo; st.vw = r.width;
+  if (!st.duration || Math.abs(st.duration - r.duration) > 1) initRange(r.duration);
+  else st.duration = r.duration;
+  $('use-cover').checked = r.hasVideo && wantCover;
+  $('b-cover').disabled = !r.hasVideo;
+  if (st.fallback) showStill(st.t);
+  scheduleMeasure();
+  $('b-export').disabled = false;
 }
 
 // ---------- 現在位置
@@ -431,7 +587,7 @@ async function pickCover() {
   st.coverSrc = src; st.coverTime = t;
   stage.replaceChildren(src, cropBox);
   $('cover-t').textContent = `${fmt(t)} のフレーム`;
-  $('use-cover').checked = true;
+  $('use-cover').checked = true; wantCover = true;
   renderCover();
   syncRange();
 }
@@ -541,10 +697,21 @@ document.addEventListener('keydown', e => {
 });
 
 // ---------- 書き出し
+// 書き出し結果（リストの各動画に残し、開き直したときにも出す）
+function showResult(item) {
+  const r = item.result;
+  if (!r) { $('result').textContent = ''; return; }
+  $('result').innerHTML = `<a href="${r.href}">${esc(r.filename)}</a> <span class="muted">(${r.info})</span>`
+    + (r.warn ? `<div class="err">${r.warn}</div>` : '');
+}
+
 $('b-export').onclick = async () => {
   if (!st.id) return;
   savePrefs();
+  const item = queue[curIdx];
+  const here = () => queue[curIdx] === item;   // 書き出し中に別の動画へ移ったら画面は触らない
   const btn = $('b-export');
+  item.busy = true;
   btn.disabled = true; $('result').textContent = '';
   $('status').textContent = '変換中…'; $('ex-barwrap').style.display = 'block'; $('ex-bar').style.width = '0';
   const body = {
@@ -564,28 +731,42 @@ $('b-export').onclick = async () => {
       await new Promise(ok => setTimeout(ok, 500));
       const j = await (await fetch('api/job?id=' + r.job)).json();
       if (j.error && j.state !== 'error') throw new Error(j.error);
-      $('ex-bar').style.width = (j.progress * 100) + '%';
-      $('status').textContent = `変換中… ${Math.floor(j.progress * 100)}%`;
+      if (here()) {
+        $('ex-bar').style.width = (j.progress * 100) + '%';
+        $('status').textContent = `変換中… ${Math.floor(j.progress * 100)}%`;
+      }
       if (j.state === 'error') throw new Error(j.error);
       if (j.state === 'done') {
         const href = 'api/download?id=' + r.job;
-        $('status').textContent = '完了';
         let info = `${(j.size / 1048576).toFixed(1)} MB`;
         let warn = '';
         if (j.loud) {
           info += ` / ${j.loud.i.toFixed(1)} LUFS・ピーク ${j.loud.tp.toFixed(1)} dBTP`;
           if (body.volMode === 'abs' && j.loud.i < body.targetLufs - 1)
-            warn = `<div class="err">目標 ${body.targetLufs} LUFS に届きませんでした。ピークの大きい音なので、音割れを防ぐ処理が上げ幅を抑えています。</div>`;
+            warn = `目標 ${body.targetLufs} LUFS に届きませんでした。ピークの大きい音なので、音割れを防ぐ処理が上げ幅を抑えています。`;
         }
-        $('result').innerHTML = `<a href="${href}">${esc(j.filename)}</a> <span class="muted">(${info})</span>${warn}`;
+        item.status = 'done';
+        item.result = { href, filename: j.filename, info, warn };
         location.href = href;   // Content-Disposition: attachment なのでページは移動しない
+        renderQueue();
+        if (here()) {
+          showResult(item);
+          const n = nextWaiting();
+          if (queue.length > 1 && n < 0) $('status').textContent = '完了 — 全部終わりました';
+          else if (n >= 0 && $('auto-next').checked) {
+            $('status').textContent = '完了 — 次の動画へ';
+            setTimeout(() => { if (here()) openItem(n); }, 800);   // ダウンロードが始まるのを待ってから
+          } else $('status').textContent = '完了';
+        }
         break;
       }
     }
   } catch (e) {
-    $('status').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+    if (here()) $('status').innerHTML = `<span class="err">${esc(e.message)}</span>`;
   } finally {
-    btn.disabled = false;
+    item.busy = false;
+    if (item.releaseLater) { item.releaseLater = false; release(item); }
+    if (here()) btn.disabled = false;
   }
 };
 
