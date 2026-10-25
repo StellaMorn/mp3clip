@@ -1,0 +1,7 @@
+{
+  "_comment": "config.json にコピーして使う。「このPCのフォルダから選ぶ」で見せるフォルダ。ここの動画はアップロード（コピー）せずにそのまま読む。書き込みも削除もしない。config.json が無ければこの機能は出ない。",
+  "roots": [
+    { "name": "Videos", "path": "C:/Users/you/Videos" },
+    { "name": "Downloads", "path": "D:/Downloads" }
+  ]
+}

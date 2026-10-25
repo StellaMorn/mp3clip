@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const { pipeline } = require('stream');
 
 const PORT = Number(process.env.PORT) || 5190;
 const HOST = process.env.HOST || '127.0.0.1';
@@ -25,7 +26,8 @@ const FFPROBE = findBin('ffprobe');
 fs.mkdirSync(WORK, { recursive: true });
 
 // ---------------------------------------------------------------- 状態
-const uploads = new Map();   // id -> { file, name, duration, ... }
+// id -> { file, name, duration, ... }。local: true は「このPCのフォルダ」の元ファイルを直接指す（消さない）
+const uploads = new Map();
 const jobs = new Map();      // id -> { state, progress, error, out, filename }
 
 const newId = () => crypto.randomBytes(8).toString('hex');
@@ -37,7 +39,8 @@ function cleanup() {
     const p = path.join(WORK, f);
     try { if (fs.statSync(p).mtimeMs < limit) fs.unlinkSync(p); } catch {}
   }
-  for (const [id, u] of uploads) if (!fs.existsSync(u.file)) uploads.delete(id);
+  // 元ファイルを指すエントリは表から外すだけ（work/ の外なので上のループでも消えない）
+  for (const [id, u] of uploads) if (!fs.existsSync(u.file) || (u.local && u.used < limit)) uploads.delete(id);
   for (const [id, j] of jobs) if (j.out && !fs.existsSync(j.out)) jobs.delete(id);
 }
 cleanup();
@@ -180,6 +183,40 @@ async function exportJob(job, u, o) {
   try { job.loud = await loudness(['-i', job.out, '-map', '0:a:0']); } catch { job.loud = null; }
 }
 
+// ---------------------------------------------------------------- このPCのフォルダ（コピーしない）
+// config.json の roots にあるフォルダの動画を、アップロードせずにそのまま読む。書き込み・削除は一切しない
+const MEDIA_EXT = /\.(mp4|m4v|mkv|webm|mov|avi|wmv|flv|ts|m2ts|mts|mpg|mpeg|3gp|ogv|m4a|mp3|aac|flac|wav|ogg|opus)$/i;
+const MIME = {
+  '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.webm': 'video/webm', '.mkv': 'video/x-matroska',
+  '.mov': 'video/quicktime', '.ogv': 'video/ogg', '.avi': 'video/x-msvideo', '.wmv': 'video/x-ms-wmv',
+  '.ts': 'video/mp2t', '.m2ts': 'video/mp2t', '.mts': 'video/mp2t', '.mpg': 'video/mpeg', '.mpeg': 'video/mpeg',
+  '.3gp': 'video/3gpp', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.flac': 'audio/flac',
+  '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.opus': 'audio/ogg',
+};
+
+// 毎回読む（config.json を書き換えたらサーバを再起動しなくても反映される）。無ければ機能ごと出さない
+function roots() {
+  try {
+    const c = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
+    return (c.roots || []).filter(r => r && r.path).map(r => ({ name: String(r.name || r.path), path: path.resolve(r.path) }));
+  } catch { return []; }
+}
+
+// root 番号＋相対パス → 実パス。root の外に出るもの（.. やリンクで抜けるもの）は null
+function resolveLocal(rootIdx, rel) {
+  const r = roots()[Number(rootIdx)];
+  if (!r) return null;
+  const inside = (p, base) => {
+    const x = path.relative(base, p);   // Windows では大文字小文字を区別せずに比べる
+    return x !== '..' && !x.startsWith('..' + path.sep) && !path.isAbsolute(x);
+  };
+  const abs = path.resolve(r.path, String(rel || '').replace(/^[\\/]+/, ''));
+  if (!inside(abs, r.path)) return null;
+  try { if (!inside(fs.realpathSync.native(abs), fs.realpathSync.native(r.path))) return null; }
+  catch { return null; }
+  return { abs, root: r };
+}
+
 const num = (v, d) => (v === '' || v == null || !isFinite(Number(v))) ? d : Number(v);
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
@@ -200,10 +237,12 @@ function readJson(req, limit = 64 * 1024) {
   });
 }
 
-function getUpload(q) {
-  const id = q.get('id') || '';
-  return ID_RE.test(id) ? uploads.get(id) : null;
+function findUpload(id) {
+  const u = ID_RE.test(id || '') ? uploads.get(id) : null;
+  if (u) u.used = Date.now();
+  return u;
 }
+const getUpload = q => findUpload(q.get('id'));
 
 function contentDisposition(name) {
   const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
@@ -242,11 +281,64 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { id, name, ...info });
     }
 
-    // 連続処理で済んだ動画を消す（12 時間待たずに work/ を空ける）
+    // 連続処理で済んだ動画を消す（12 時間待たずに work/ を空ける）。このPCの元ファイルは表から外すだけ
     if (req.method === 'DELETE' && p === '/api/upload') {
       const u = getUpload(q);
-      if (u) { uploads.delete(u.id); fs.unlink(u.file, () => {}); }
+      if (u) { uploads.delete(u.id); if (!u.local) fs.unlink(u.file, () => {}); }
       return send(res, 200, { ok: true });
+    }
+
+    if (req.method === 'GET' && p === '/api/roots') {
+      return send(res, 200, { roots: roots().map((r, i) => ({ i, name: r.name })) });
+    }
+
+    // フォルダの中身（サブフォルダと、動画・音声ファイル）
+    if (req.method === 'GET' && p === '/api/browse') {
+      const loc = resolveLocal(q.get('root'), q.get('dir'));
+      if (!loc) return fail(res, 404, 'フォルダが見つかりません');
+      const ents = await fs.promises.readdir(loc.abs, { withFileTypes: true });
+      const skip = n => n.startsWith('.') || n.startsWith('$');   // 隠しフォルダや $RECYCLE.BIN
+      const dirs = ents.filter(e => e.isDirectory() && !skip(e.name)).map(e => e.name);
+      const files = (await Promise.all(ents.filter(e => e.isFile() && MEDIA_EXT.test(e.name)).map(e =>
+        fs.promises.stat(path.join(loc.abs, e.name)).then(s => ({ name: e.name, size: s.size, mtime: s.mtimeMs }), () => null))))
+        .filter(Boolean);
+      const coll = new Intl.Collator('ja', { numeric: true });
+      dirs.sort(coll.compare); files.sort((a, b) => coll.compare(a.name, b.name));
+      const dir = path.relative(loc.root.path, loc.abs).split(path.sep).join('/');
+      return send(res, 200, { root: loc.root.name, dir, dirs, files });
+    }
+
+    // このPCのファイルを開く：コピーせず元ファイルを指すエントリを作る（以降はアップロードと同じ id で扱える）
+    if (req.method === 'POST' && p === '/api/open-local') {
+      const o = await readJson(req);
+      const loc = resolveLocal(o.root, o.path);
+      if (!loc || !MEDIA_EXT.test(loc.abs) || !fs.statSync(loc.abs).isFile()) return fail(res, 404, 'ファイルが見つかりません');
+      let info;
+      try { info = await probe(loc.abs); }
+      catch (e) { return fail(res, 400, '動画として読めません: ' + e.message); }
+      if (!info.hasAudio) return fail(res, 400, '音声トラックがありません');
+      const id = newId(), name = path.basename(loc.abs);
+      uploads.set(id, { id, file: loc.abs, name, local: true, used: Date.now(), ...info });
+      return send(res, 200, { id, name, ...info });
+    }
+
+    // プレビュー用の動画配信（Range 対応。このPCのファイルをブラウザで再生する）
+    if (req.method === 'GET' && p === '/api/video') {
+      const u = getUpload(q);
+      if (!u) return fail(res, 404, 'not found');
+      const size = (await fs.promises.stat(u.file)).size;
+      const head = { 'Content-Type': MIME[path.extname(u.file).toLowerCase()] || 'application/octet-stream',
+        'Accept-Ranges': 'bytes', 'Cache-Control': 'private, max-age=3600' };
+      const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+      let start = 0, end = size - 1;
+      if (m && (m[1] || m[2])) {
+        if (m[1] === '') start = Math.max(0, size - Number(m[2]));   // bytes=-N（末尾 N バイト）
+        else { start = Number(m[1]); if (m[2]) end = Math.min(Number(m[2]), size - 1); }
+        if (start >= size || start > end) { res.writeHead(416, { 'Content-Range': `bytes */${size}` }); return res.end(); }
+        res.writeHead(206, { ...head, 'Content-Length': end - start + 1, 'Content-Range': `bytes ${start}-${end}/${size}` });
+      } else res.writeHead(200, { ...head, 'Content-Length': size });
+      // シークのたびにブラウザが接続を切るので、切れたら読み出しも止める（pipeline が両方閉じる）
+      return pipeline(fs.createReadStream(u.file, { start, end }), res, () => {});
     }
 
     // 指定時刻のフレーム（ブラウザで再生できない形式のときのプレビュー用）
@@ -275,7 +367,7 @@ const server = http.createServer(async (req, res) => {
     // 変換は時間がかかるのでジョブにして返す（hub のプロキシタイムアウトに掛からないように）
     if (req.method === 'POST' && p === '/api/export') {
       const o = await readJson(req, 20 * 1024 * 1024);   // ジャケットの JPEG を含む
-      const u = ID_RE.test(o.id || '') ? uploads.get(o.id) : null;
+      const u = findUpload(o.id);
       if (!u) return fail(res, 404, '動画が見つかりません。もう一度読み込んでください');
       const job = { id: newId(), state: 'running', progress: 0, error: null, out: null,
         filename: safeName(o.filename || o.title || path.parse(u.name).name) + '.mp3' };

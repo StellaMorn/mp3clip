@@ -52,6 +52,19 @@ body:not(.multi) .q-only { display: none !important; }
 .q-info { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--muted); }
 .q-info a { color: var(--accent); }
 .q-del { flex: none; padding: 0 6px; border: 0; background: none; color: var(--muted); }
+.q-pc { font-size: 10px; border: 1px solid var(--line); border-radius: 3px; padding: 0 3px; margin-right: 6px;
+  color: var(--muted); vertical-align: 1px; }
+
+#browse { margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+#br-path { overflow-wrap: anywhere; }
+#br-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 50vh; overflow-y: auto; border-top: 1px solid var(--line); }
+.br-item { display: flex; gap: 8px; align-items: center; padding: 6px 4px; border-bottom: 1px solid var(--line);
+  cursor: pointer; font-size: 14px; }
+.br-item:hover { background: var(--sel); }
+.br-item .n { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.br-item .m { flex: none; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.br-dir .n::before { content: '▸ '; color: var(--muted); }
+.br-empty { padding: 10px 4px; color: var(--muted); font-size: 13px; }
 
 .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
 .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
@@ -98,6 +111,26 @@ body.vol-abs .rel-only, body:not(.vol-abs) .abs-only { display: none; }
       <div><b>動画をドロップ</b>（複数可）またはクリックして選択</div>
       <div class="muted" id="pick-note">mp4 / mkv / webm / mov など。ffmpeg が読めれば何でも可</div>
     </label>
+    <div id="local-row" class="row" style="display:none;margin-top:8px">
+      <button id="br-open">このPCのフォルダから選ぶ</button>
+      <span class="muted">アップロードせずにそのまま使います（コピーしないので待ちません）</span>
+    </div>
+    <div id="browse" style="display:none">
+      <div class="row">
+        <select id="br-root"></select>
+        <span id="br-path" class="muted"></span>
+        <span class="row" style="margin-left:auto;gap:6px">
+          <select id="br-sort"><option value="name">名前順</option><option value="new">新しい順</option></select>
+          <button id="br-close">閉じる</button>
+        </span>
+      </div>
+      <ul id="br-list"></ul>
+      <div class="row" style="margin-top:8px">
+        <button id="br-all">このフォルダの動画を全部選ぶ</button>
+        <button id="br-add" class="primary" disabled>選んだ動画を追加</button>
+        <span id="br-note" class="muted"></span>
+      </div>
+    </div>
     <div id="queue" style="display:none;margin-top:10px">
       <div class="muted" id="q-sum"></div>
       <ol id="q-list"></ol>
@@ -245,7 +278,16 @@ drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('
 
 function addFiles(files) {
   const first = queue.length;
-  for (const f of files) queue.push({ file: f, status: 'wait', prog: 0 });
+  for (const f of files) queue.push({ file: f, name: f.name, status: 'wait', prog: 0 });
+  afterAdd(first);
+}
+// このPCのフォルダから選んだもの（{ root, path, name }）。コピーせず、サーバが元ファイルを直接読む
+function addLocal(list) {
+  const first = queue.length;
+  for (const l of list) queue.push({ local: { root: l.root, path: l.path }, name: l.name, status: 'wait', prog: 0 });
+  afterAdd(first);
+}
+function afterAdd(first) {
   if (queue.length === first) return;
   if (curIdx < 0) openItem(first);
   else { renderQueue(); pump(); }
@@ -264,7 +306,7 @@ function openItem(i) {
   const prev = queue[curIdx], item = queue[i];
   if (prev && prev !== item && (prev.status === 'done' || prev.status === 'skip') && !prev.busy) release(prev);
   curIdx = i;
-  st.file = item.file; st.id = null; st.coverTime = null; st.coverSrc = null; st.fallback = false; st.hasVideo = true;
+  st.file = item; st.id = null; st.coverTime = null; st.coverSrc = null; st.fallback = false; st.hasVideo = true;
   $('b-cover').disabled = false; $('use-cover').checked = wantCover;
   st.duration = 0; st.start = st.end = 0; st.t = 0; st.stopAt = null;
   $('crop').style.display = 'none';
@@ -272,20 +314,27 @@ function openItem(i) {
   $('ex-barwrap').style.display = 'none';
   $('status').textContent = item.status === 'queued' ? (item.busy ? '変換中…' : '予約済み — アップロードが済んだら作ります') : '';
   showResult(item);
-  $('title').value = item.file.name.replace(/\.[^.]+$/, '');
+  $('title').value = item.name.replace(/\.[^.]+$/, '');
   $('cover-prev').innerHTML = '「このフレームを<br>ジャケットに」<br>で選ぶ';
   $('cover-t').textContent = '未選択なら開始位置のフレーム';
   $('player').style.display = 'block';
   still.style.display = 'none'; video.style.display = 'block'; $('fallback-note').style.display = 'none';
   $('b-play').disabled = false;
-  if (video.src) URL.revokeObjectURL(video.src);
-  video.src = URL.createObjectURL(item.file);   // プレビューは手元のファイルで即座に。アップロードは裏で
+  setSource(item);
   if (item.err && !item.up) item.err = null;    // 失敗していたら開き直しで再挑戦
   if (item.info) applyInfo(item.info);
   updateExportBtn();
   showUp(item);
   pump();
   renderQueue();
+}
+
+// プレビューの再生元。手元のファイルはその場で、このPCのファイルはサーバから（開けたら）流す
+function setSource(item) {
+  if (video.src.startsWith('blob:')) URL.revokeObjectURL(video.src);
+  if (item.file) video.src = URL.createObjectURL(item.file);
+  else if (item.id) video.src = 'api/video?id=' + item.id;
+  else { video.removeAttribute('src'); video.load(); }
 }
 
 // 書き出しボタン：手元で動画が開ければ（長さが分かれば）アップロード前でも押せる
@@ -296,10 +345,11 @@ function updateExportBtn() {
 
 function uploadItem(item) {
   item.prog = 0; item.err = null;
+  if (item.local) return openLocal(item);
   return new Promise((resolve, reject) => {
     const xhr = item.xhr = new XMLHttpRequest();
     const fail = msg => { item.err = msg; item.up = null; tick(item); reject(new Error(msg)); };
-    xhr.open('PUT', 'api/upload?name=' + encodeURIComponent(item.file.name));
+    xhr.open('PUT', 'api/upload?name=' + encodeURIComponent(item.name));
     xhr.upload.onprogress = e => { if (e.lengthComputable) { item.prog = e.loaded / e.total; tick(item); } };
     xhr.onload = () => {
       let r = {}; try { r = JSON.parse(xhr.responseText); } catch {}
@@ -312,20 +362,40 @@ function uploadItem(item) {
   });
 }
 
-// アップロードの順番待ち（同時に上げるのは1本）。予約済みと今の動画を一覧の順に、
-// それが無ければ次に作業する1本を先に上げておく
-function pump() {
-  if (queue.some(q => q.up && !q.id)) return;
-  const ready = q => !q.id && !q.up && !q.err;
-  let item = queue.find((q, i) => ready(q) && (q.status === 'queued' || i === curIdx));
-  if (!item) {
-    const cur = queue[curIdx], n = nextWaiting();
-    if (cur && cur.id && n >= 0 && ready(queue[n])) item = queue[n];
+// このPCのファイルを開く（サーバが ffprobe するだけ。コピーしないので一瞬）
+async function openLocal(item) {
+  try {
+    const res = await fetch('api/open-local', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(item.local) });
+    const r = await res.json();
+    if (!res.ok) throw new Error(r.error || '開けませんでした');
+    item.id = r.id; item.info = r; item.prog = 1; tick(item);
+    return r;
+  } catch (e) {
+    item.err = e.message; item.up = null; tick(item);
+    throw e;
   }
-  if (!item) return;
+}
+
+// 用意（アップロード）の順番待ち。予約済みと今の動画を一覧の順に、それが無ければ次に作業する1本を先に。
+// アップロードは回線を取り合わないよう同時に1本。このPCのファイルは回線を使わないので待たずに開く
+function pump() {
+  const ready = q => !q.id && !q.up && !q.err;
+  const wanted = queue.filter((q, i) => ready(q) && (q.status === 'queued' || i === curIdx));
+  const cur = queue[curIdx], n = nextWaiting();
+  if (!wanted.length && cur && cur.id && n >= 0 && ready(queue[n])) wanted.push(queue[n]);
+  for (const q of wanted) if (q.local) prepare(q);
+  if (queue.some(q => !q.local && q.up && !q.id)) return;
+  const item = wanted.find(q => !q.local);
+  if (item) prepare(item);
+}
+function prepare(item) {
   item.up = uploadItem(item);
   item.up.then(r => {
-    if (queue[curIdx] === item && st.file === item.file && !st.id) applyInfo(r);
+    if (queue[curIdx] === item && st.file === item && !st.id) {
+      if (item.local) setSource(item);   // このPCのファイルは開けてから再生できる
+      applyInfo(r);
+    }
     if (item.pending) runExport(item);
   }, () => {}).finally(pump);
 }
@@ -378,10 +448,12 @@ function showUp(item) {
   if (item.err) { $('up-label').innerHTML = `<span class="err">${esc(item.err)}</span>`; $('up-pct').textContent = ''; return; }
   if (item.info) {
     const r = item.info;
-    $('up-label').textContent = `${item.file.name} — ${fmt(r.duration)}${r.hasVideo ? `　${r.width}×${r.height}` : '　映像なし'}`;
+    $('up-label').textContent = `${item.name} — ${fmt(r.duration)}${r.hasVideo ? `　${r.width}×${r.height}` : '　映像なし'}`
+      + (item.local ? '　（このPCのファイルをそのまま使用）' : '');
     $('up-pct').textContent = ''; $('up-bar').style.width = '100%';
     return;
   }
+  if (item.local) { $('up-label').textContent = '開いています…'; $('up-pct').textContent = ''; $('up-bar').style.width = '0'; return; }
   $('up-label').textContent = item.prog >= 1 ? '解析中…' : 'アップロード中…';
   $('up-pct').textContent = Math.floor(item.prog * 100) + '%';
   $('up-bar').style.width = (item.prog * 100) + '%';
@@ -409,10 +481,11 @@ function renderQueue() {
     else if (q.exportErr) info = `<span class="err">${esc(q.exportErr)}</span>`;
     else if (q.err) info = `<span class="err">${esc(q.err)}</span>`;
     else if (q.busy) info = `変換中 ${pct(q.jobProg || 0)}`;
-    else if (q.status === 'queued') info = q.up && !q.id ? `作成待ち・アップロード ${pct(q.prog)}` : '作成待ち';
-    else if (q.up && !q.id) info = `アップロード ${pct(q.prog)}`;
+    else if (q.status === 'queued') info = q.up && !q.id && !q.local ? `作成待ち・アップロード ${pct(q.prog)}` : '作成待ち';
+    else if (q.up && !q.id) info = q.local ? '開いています' : `アップロード ${pct(q.prog)}`;
     else if (q.id && !isCur) info = '準備OK';
-    li.innerHTML = `<span class="q-mark">${mark}</span><span class="q-name">${esc(q.file.name)}</span>`
+    li.innerHTML = `<span class="q-mark">${mark}</span><span class="q-name" title="${q.local ? 'このPCのファイル' : ''}">`
+      + `${q.local ? '<span class="q-pc">PC</span>' : ''}${esc(q.name)}</span>`
       + `<span class="q-info">${info}</span>`
       + (isCur || q.busy ? '' : '<button class="q-del" title="リストから外す">×</button>');
     li.onclick = e => {
@@ -720,7 +793,7 @@ document.addEventListener('keydown', e => {
   else if (k === 'arrowleft' || k === 'arrowright') {
     e.preventDefault();
     seek(cur() + (k === 'arrowleft' ? -1 : 1) * (e.shiftKey ? 0.1 : 1));
-  } else if (k === ' ' && !st.fallback && e.target !== video) {
+  } else if (k === ' ' && !st.fallback && e.target !== video && !e.target.matches('input[type=checkbox]')) {
     e.preventDefault(); video.paused ? video.play() : video.pause();
   } else return;
 });
@@ -815,6 +888,112 @@ function download(href) {
   a.href = href; a.download = '';
   document.body.appendChild(a); a.click(); a.remove();
 }
+
+// ---------- このPCのフォルダから選ぶ（config.json の roots。無ければボタンごと出さない）
+const br = { root: 0, dir: '', data: null, sel: new Set() };
+const BR_KEY = 'mp3clip-browse';   // 最後に見ていたフォルダと並び順（このブラウザだけの記憶）
+
+(async () => {
+  try {
+    const r = await (await fetch('api/roots')).json();
+    if (!r.roots || !r.roots.length) return;
+    $('br-root').replaceChildren(...r.roots.map(x => new Option(x.name, x.i)));
+    try {
+      const s = JSON.parse(localStorage.getItem(BR_KEY) || '{}');
+      if (r.roots.some(x => x.i === s.root)) { br.root = s.root; br.dir = s.dir || ''; }
+      if (s.sort) $('br-sort').value = s.sort;
+    } catch {}
+    $('br-root').value = br.root;
+    $('local-row').style.display = 'flex';
+  } catch {}
+})();
+
+async function browse(root, dir) {
+  $('br-note').textContent = '読み込み中…';
+  try {
+    const res = await fetch(`api/browse?root=${root}&dir=${encodeURIComponent(dir)}`);
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || '開けませんでした');
+    Object.assign(br, { root, dir: d.dir, data: d });
+    br.sel.clear();
+    $('br-root').value = root;
+    saveBrowse();
+    renderBrowse();
+    $('br-note').textContent = '';
+  } catch (e) {
+    if (dir) return browse(root, '');   // 覚えていたフォルダが無くなっていたら先頭へ
+    $('br-note').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+}
+function saveBrowse() {
+  try { localStorage.setItem(BR_KEY, JSON.stringify({ root: br.root, dir: br.dir, sort: $('br-sort').value })); } catch {}
+}
+
+// 表示順のファイル（追加もこの順で一覧に積む）
+function browseFiles() {
+  const files = [...br.data.files];
+  if ($('br-sort').value === 'new') files.sort((a, b) => b.mtime - a.mtime);
+  return files.map(f => ({ ...f, rel: br.dir ? br.dir + '/' + f.name : f.name }));
+}
+
+function renderBrowse() {
+  const d = br.data;
+  if (!d) return;
+  $('br-path').textContent = '/' + d.dir;
+  const row = (cls, html, onclick) => {
+    const li = document.createElement('li');
+    li.className = cls; li.innerHTML = html; li.onclick = onclick;
+    return li;
+  };
+  const rows = [];
+  if (d.dir) rows.push(row('br-item br-dir', '<span class="n">上のフォルダへ</span>',
+    () => browse(br.root, d.dir.split('/').slice(0, -1).join('/'))));
+  for (const n of d.dirs) rows.push(row('br-item br-dir', `<span class="n">${esc(n)}</span>`,
+    () => browse(br.root, d.dir ? d.dir + '/' + n : n)));
+  const mb = n => n >= 1073741824 ? (n / 1073741824).toFixed(1) + ' GB' : Math.max(0.1, n / 1048576).toFixed(1) + ' MB';
+  const day = t => { const x = new Date(t); return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`; };
+  for (const f of browseFiles()) {
+    const inQueue = queue.some(q => q.local && q.local.root === br.root && q.local.path === f.rel);
+    const li = row('br-item', `<input type="checkbox"${br.sel.has(f.rel) ? ' checked' : ''}>`
+      + `<span class="n">${esc(f.name)}${inQueue ? ' <span class="muted">（一覧にあり）</span>' : ''}</span>`
+      + `<span class="m">${mb(f.size)}　${day(f.mtime)}</span>`, null);
+    const cb = li.querySelector('input');
+    li.onclick = e => {
+      if (e.target !== cb) cb.checked = !cb.checked;
+      if (cb.checked) br.sel.add(f.rel); else br.sel.delete(f.rel);
+      updateBrowseBtn();
+    };
+    rows.push(li);
+  }
+  if (!d.dirs.length && !d.files.length) rows.push(row('br-empty', 'このフォルダには動画がありません', null));
+  $('br-list').replaceChildren(...rows);
+  updateBrowseBtn();
+}
+function updateBrowseBtn() {
+  $('br-add').disabled = !br.sel.size;
+  $('br-add').textContent = br.sel.size ? `選んだ ${br.sel.size} 本を追加` : '選んだ動画を追加';
+}
+
+$('br-open').onclick = () => {
+  const open = $('browse').style.display !== 'none';
+  $('browse').style.display = open ? 'none' : 'block';
+  if (!open && !br.data) browse(br.root, br.dir);
+};
+$('br-close').onclick = () => { $('browse').style.display = 'none'; };
+$('br-root').onchange = () => browse(Number($('br-root').value), '');
+$('br-sort').onchange = () => { saveBrowse(); renderBrowse(); };
+$('br-all').onclick = () => {
+  const files = browseFiles();
+  const all = files.length && files.every(f => br.sel.has(f.rel));
+  for (const f of files) all ? br.sel.delete(f.rel) : br.sel.add(f.rel);
+  renderBrowse();
+};
+$('br-add').onclick = () => {
+  const picked = browseFiles().filter(f => br.sel.has(f.rel)).map(f => ({ root: br.root, path: f.rel, name: f.name }));
+  br.sel.clear();
+  $('browse').style.display = 'none';
+  addLocal(picked);
+};
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }
 </script>
