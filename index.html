@@ -230,8 +230,11 @@ loadPrefs();
 
 // ---------- 動画のリスト（連続処理）
 // 選んだファイルは参照を持つだけで中身は読まない。開くのは今の1本だけ（動画はディスクから直接再生）。
-// サーバへは「今の1本＋次の1本」だけを上げておき、済んだ動画のアップロードはすぐ消す
-const queue = [];   // { file, status: 'wait'|'done'|'skip', up, xhr, id, info, prog, err, busy, result }
+// 「MP3 を作る」はアップロード前でも押せる。押した時点の設定を予約（pending）として持ち、
+// アップロードが済んだら裏で変換する。アップロードは1本ずつ、予約済みと今の動画を優先し、
+// 手が空いたら次の1本だけ先に上げる。済んだ動画のアップロードはすぐ消す
+//   status: 'wait'（未作業）→ 'queued'（予約済み）→ 'done' / 'skip'
+const queue = [];   // { file, status, up, xhr, id, info, prog, err, pending, busy, jobProg, exportErr, result }
 let curIdx = -1;
 
 const drop = $('drop');
@@ -245,7 +248,7 @@ function addFiles(files) {
   for (const f of files) queue.push({ file: f, status: 'wait', prog: 0 });
   if (queue.length === first) return;
   if (curIdx < 0) openItem(first);
-  else { renderQueue(); prefetch(); }
+  else { renderQueue(); pump(); }
 }
 
 // 次に作業する動画（今より後ろ → 先頭から、の順で「待ち」を探す）
@@ -259,13 +262,15 @@ function nextWaiting() {
 
 function openItem(i) {
   const prev = queue[curIdx], item = queue[i];
-  if (prev && prev !== item && prev.status !== 'wait') release(prev);
+  if (prev && prev !== item && (prev.status === 'done' || prev.status === 'skip') && !prev.busy) release(prev);
   curIdx = i;
-  st.file = item.file; st.id = null; st.coverTime = null; st.coverSrc = null; st.fallback = false;
+  st.file = item.file; st.id = null; st.coverTime = null; st.coverSrc = null; st.fallback = false; st.hasVideo = true;
+  $('b-cover').disabled = false; $('use-cover').checked = wantCover;
   st.duration = 0; st.start = st.end = 0; st.t = 0; st.stopAt = null;
   $('crop').style.display = 'none';
   st.loudKey = null; st.loud = null; renderLoud();
-  $('status').textContent = ''; $('ex-barwrap').style.display = 'none';
+  $('ex-barwrap').style.display = 'none';
+  $('status').textContent = item.status === 'queued' ? (item.busy ? '変換中…' : '予約済み — アップロードが済んだら作ります') : '';
   showResult(item);
   $('title').value = item.file.name.replace(/\.[^.]+$/, '');
   $('cover-prev').innerHTML = '「このフレームを<br>ジャケットに」<br>で選ぶ';
@@ -273,16 +278,20 @@ function openItem(i) {
   $('player').style.display = 'block';
   still.style.display = 'none'; video.style.display = 'block'; $('fallback-note').style.display = 'none';
   $('b-play').disabled = false;
-  $('b-export').disabled = true;
   if (video.src) URL.revokeObjectURL(video.src);
   video.src = URL.createObjectURL(item.file);   // プレビューは手元のファイルで即座に。アップロードは裏で
-  if (!item.up) item.up = uploadItem(item);
+  if (item.err && !item.up) item.err = null;    // 失敗していたら開き直しで再挑戦
+  if (item.info) applyInfo(item.info);
+  updateExportBtn();
   showUp(item);
-  item.up.then(r => {
-    if (queue[curIdx] === item && st.file === item.file && !st.id) applyInfo(r);
-    prefetch();
-  }, () => {});
+  pump();
   renderQueue();
+}
+
+// 書き出しボタン：手元で動画が開ければ（長さが分かれば）アップロード前でも押せる
+function updateExportBtn() {
+  const item = queue[curIdx];
+  $('b-export').disabled = !item || item.busy || !(st.id || st.duration > 0);
 }
 
 function uploadItem(item) {
@@ -303,20 +312,27 @@ function uploadItem(item) {
   });
 }
 
-// 今の動画が上がったら、次の1本だけ先に上げておく（同時に上げるのは1本まで）
-function prefetch() {
-  const cur = queue[curIdx];
-  if (!cur || !cur.id) return;
+// アップロードの順番待ち（同時に上げるのは1本）。予約済みと今の動画を一覧の順に、
+// それが無ければ次に作業する1本を先に上げておく
+function pump() {
   if (queue.some(q => q.up && !q.id)) return;
-  const n = nextWaiting();
-  if (n < 0 || queue[n].up || queue[n].err) return;
-  queue[n].up = uploadItem(queue[n]);
-  queue[n].up.then(prefetch, () => {});
+  const ready = q => !q.id && !q.up && !q.err;
+  let item = queue.find((q, i) => ready(q) && (q.status === 'queued' || i === curIdx));
+  if (!item) {
+    const cur = queue[curIdx], n = nextWaiting();
+    if (cur && cur.id && n >= 0 && ready(queue[n])) item = queue[n];
+  }
+  if (!item) return;
+  item.up = uploadItem(item);
+  item.up.then(r => {
+    if (queue[curIdx] === item && st.file === item.file && !st.id) applyInfo(r);
+    if (item.pending) runExport(item);
+  }, () => {}).finally(pump);
 }
 
-// 済んだ動画のアップロードを消す。書き出し中なら終わってから
+// 済んだ動画のアップロードを消す
 function release(item) {
-  if (item.busy) { item.releaseLater = true; return; }
+  if (item.busy) return;   // 変換が終わったときに runExport が消す
   if (item.xhr && !item.id) item.xhr.abort();
   if (item.id) fetch('api/upload?id=' + item.id, { method: 'DELETE' }).catch(() => {});
   item.id = null; item.info = null; item.up = null; item.prog = 0;
@@ -328,12 +344,19 @@ addEventListener('pagehide', e => {
   for (const q of queue) if (q.id) fetch('api/upload?id=' + q.id, { method: 'DELETE', keepalive: true }).catch(() => {});
 });
 
+// 予約や変換が残っているうちに閉じようとしたら確かめる
+addEventListener('beforeunload', e => {
+  if (queue.some(q => q.status === 'queued')) { e.preventDefault(); e.returnValue = ''; }
+});
+
 function removeItem(i) {
-  if (i === curIdx) return;
-  release(queue[i]);
+  const item = queue[i];
+  if (i === curIdx || item.busy) return;
+  item.pending = null;   // 予約も取り消す
+  release(item);
   queue.splice(i, 1);
   if (i < curIdx) curIdx--;
-  renderQueue(); prefetch();
+  renderQueue(); pump();
 }
 
 $('b-skip').onclick = () => {
@@ -368,25 +391,30 @@ function renderQueue() {
   document.body.classList.toggle('multi', queue.length > 1);
   $('queue').style.display = queue.length > 1 ? 'block' : 'none';
   drop.classList.toggle('compact', queue.length > 0);
-  const done = queue.filter(q => q.status === 'done').length;
-  const skip = queue.filter(q => q.status === 'skip').length;
-  $('q-sum').textContent = `${queue.length} 本中 ${done} 本完了` + (skip ? `・${skip} 本スキップ` : '');
+  const count = s => queue.filter(q => q.status === s).length;
+  const done = count('done'), skip = count('skip'), queued = count('queued');
+  $('q-sum').textContent = `${queue.length} 本中 ${done} 本完了`
+    + (queued ? `・${queued} 本作成待ち` : '') + (skip ? `・${skip} 本スキップ` : '');
   $('q-list').replaceChildren(...queue.map((q, i) => {
     const li = document.createElement('li');
     const isCur = i === curIdx;
     li.className = `q-item ${q.status}${isCur ? ' cur' : ''}`;
-    const mark = isCur ? '▶' : q.status === 'done' ? '✓' : q.status === 'skip' ? '–' : '・';
+    const mark = isCur ? '▶' : { done: '✓', skip: '–', queued: '…' }[q.status] || '・';
+    const pct = v => Math.floor(v * 100) + '%';
     let info = '';
     if (q.status === 'done' && q.result) {
       info = `→ <a href="${q.result.href}">${esc(q.result.filename)}</a>`
         + (q.result.warn ? ' <span class="err" title="目標の音量に届きませんでした">⚠</span>' : '');
     } else if (q.status === 'skip') info = 'スキップ';
+    else if (q.exportErr) info = `<span class="err">${esc(q.exportErr)}</span>`;
     else if (q.err) info = `<span class="err">${esc(q.err)}</span>`;
-    else if (q.up && !q.id) info = `アップロード ${Math.floor(q.prog * 100)}%`;
+    else if (q.busy) info = `変換中 ${pct(q.jobProg || 0)}`;
+    else if (q.status === 'queued') info = q.up && !q.id ? `作成待ち・アップロード ${pct(q.prog)}` : '作成待ち';
+    else if (q.up && !q.id) info = `アップロード ${pct(q.prog)}`;
     else if (q.id && !isCur) info = '準備OK';
     li.innerHTML = `<span class="q-mark">${mark}</span><span class="q-name">${esc(q.file.name)}</span>`
       + `<span class="q-info">${info}</span>`
-      + (isCur ? '' : '<button class="q-del" title="リストから外す">×</button>');
+      + (isCur || q.busy ? '' : '<button class="q-del" title="リストから外す">×</button>');
     li.onclick = e => {
       if (e.target.closest('a')) return;
       if (e.target.closest('.q-del')) return removeItem(i);
@@ -398,7 +426,7 @@ function renderQueue() {
   if (c) c.scrollIntoView({ block: 'nearest' });
 }
 
-video.addEventListener('loadedmetadata', () => { if (!st.id) initRange(video.duration); });
+video.addEventListener('loadedmetadata', () => { if (!st.id) initRange(video.duration); updateExportBtn(); });
 video.addEventListener('error', () => { if (st.file) enterFallback(); });
 
 function initRange(d) {
@@ -433,7 +461,7 @@ function applyInfo(r) {
   $('b-cover').disabled = !r.hasVideo;
   if (st.fallback) showStill(st.t);
   scheduleMeasure();
-  $('b-export').disabled = false;
+  updateExportBtn();
 }
 
 // ---------- 現在位置
@@ -544,7 +572,8 @@ function scheduleMeasure() {
 }
 function renderLoud() {
   const el = $('loud'), m = st.loud;
-  if (!st.id) { el.textContent = ''; return; }
+  if (!st.file) { el.textContent = ''; return; }
+  if (!st.id) { el.textContent = 'アップロードが済んだら、この範囲の音量を測ります（目標の音量での出力は測らなくても合わせます）'; return; }
   if (!m) { el.textContent = 'この範囲の音量を測っています…'; return; }
   if (m.error) { el.innerHTML = `<span class="err">測れませんでした: ${esc(m.error)}</span>`; return; }
   if (m.silent) { el.textContent = 'この範囲はほぼ無音です'; return; }
@@ -705,70 +734,87 @@ function showResult(item) {
     + (r.warn ? `<div class="err">${r.warn}</div>` : '');
 }
 
-$('b-export').onclick = async () => {
-  if (!st.id) return;
-  savePrefs();
+// 押した時点の設定を予約にする。アップロード済みならすぐ、まだならアップロード後に裏で作る
+$('b-export').onclick = () => {
   const item = queue[curIdx];
-  const here = () => queue[curIdx] === item;   // 書き出し中に別の動画へ移ったら画面は触らない
-  const btn = $('b-export');
-  item.busy = true;
-  btn.disabled = true; $('result').textContent = '';
-  $('status').textContent = '変換中…'; $('ex-barwrap').style.display = 'block'; $('ex-bar').style.width = '0';
-  const body = {
-    id: st.id, start: st.start, end: st.end,
+  if (!item || item.busy) return;
+  savePrefs();
+  item.pending = {
+    start: st.start, end: st.end,
     volMode: $('volmode').value, gainDb: Number($('gain').value), targetLufs: Number($('target').value),
     fadeIn: Number($('fadein').value) || 0, fadeOut: Number($('fadeout').value) || 0,
     cover: $('use-cover').checked && st.hasVideo,
     coverTime: st.coverTime == null ? st.start : st.coverTime, square: $('square').checked,
-    coverJpeg: coverJpeg(),
+    coverJpeg: coverJpeg(),   // ジャケットはこの動画を開いている今しか作れない
     title: $('title').value, artist: $('artist').value, album: $('album').value,
     bitrate: Number($('bitrate').value),
   };
+  item.status = 'queued'; item.result = null; item.exportErr = null;
+  $('result').textContent = '';
+  if (item.id) runExport(item);
+  else { $('status').textContent = '予約しました — アップロードが済んだら作ります'; pump(); }
+  renderQueue();
+  // 変換を待たずに次の動画へ
+  const n = nextWaiting();
+  if (n >= 0 && $('auto-next').checked) openItem(n);
+};
+
+async function runExport(item) {
+  const body = { ...item.pending, id: item.id };
+  item.pending = null; item.busy = true; item.jobProg = 0;
+  const here = () => queue[curIdx] === item;   // 別の動画を開いているあいだは画面のこの欄は触らない
+  const show = () => {
+    tick(item);
+    if (!here()) return;
+    $('ex-barwrap').style.display = 'block'; $('ex-bar').style.width = (item.jobProg * 100) + '%';
+    $('status').textContent = `変換中… ${Math.floor(item.jobProg * 100)}%`;
+  };
+  if (here()) updateExportBtn();
+  show();
   try {
     const r = await (await fetch('api/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
     if (r.error) throw new Error(r.error);
     for (;;) {
       await new Promise(ok => setTimeout(ok, 500));
       const j = await (await fetch('api/job?id=' + r.job)).json();
-      if (j.error && j.state !== 'error') throw new Error(j.error);
+      if (j.state === 'error' || (j.error && j.state !== 'done')) throw new Error(j.error);
+      item.jobProg = j.progress; show();
+      if (j.state !== 'done') continue;
+      const href = 'api/download?id=' + r.job;
+      let info = `${(j.size / 1048576).toFixed(1)} MB`;
+      let warn = '';
+      if (j.loud) {
+        info += ` / ${j.loud.i.toFixed(1)} LUFS・ピーク ${j.loud.tp.toFixed(1)} dBTP`;
+        if (body.volMode === 'abs' && j.loud.i < body.targetLufs - 1)
+          warn = `目標 ${body.targetLufs} LUFS に届きませんでした。ピークの大きい音なので、音割れを防ぐ処理が上げ幅を抑えています。`;
+      }
+      item.status = 'done';
+      item.result = { href, filename: j.filename, info, warn };
+      download(href);
       if (here()) {
-        $('ex-bar').style.width = (j.progress * 100) + '%';
-        $('status').textContent = `変換中… ${Math.floor(j.progress * 100)}%`;
+        showResult(item);
+        $('status').textContent = queue.length > 1 && !queue.some(q => q.status === 'wait' || q.status === 'queued' && q !== item)
+          ? '完了 — 全部終わりました' : '完了';
       }
-      if (j.state === 'error') throw new Error(j.error);
-      if (j.state === 'done') {
-        const href = 'api/download?id=' + r.job;
-        let info = `${(j.size / 1048576).toFixed(1)} MB`;
-        let warn = '';
-        if (j.loud) {
-          info += ` / ${j.loud.i.toFixed(1)} LUFS・ピーク ${j.loud.tp.toFixed(1)} dBTP`;
-          if (body.volMode === 'abs' && j.loud.i < body.targetLufs - 1)
-            warn = `目標 ${body.targetLufs} LUFS に届きませんでした。ピークの大きい音なので、音割れを防ぐ処理が上げ幅を抑えています。`;
-        }
-        item.status = 'done';
-        item.result = { href, filename: j.filename, info, warn };
-        location.href = href;   // Content-Disposition: attachment なのでページは移動しない
-        renderQueue();
-        if (here()) {
-          showResult(item);
-          const n = nextWaiting();
-          if (queue.length > 1 && n < 0) $('status').textContent = '完了 — 全部終わりました';
-          else if (n >= 0 && $('auto-next').checked) {
-            $('status').textContent = '完了 — 次の動画へ';
-            setTimeout(() => { if (here()) openItem(n); }, 800);   // ダウンロードが始まるのを待ってから
-          } else $('status').textContent = '完了';
-        }
-        break;
-      }
+      break;
     }
   } catch (e) {
-    if (here()) $('status').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+    item.status = 'wait'; item.exportErr = '作れませんでした: ' + e.message;
+    if (here()) $('status').innerHTML = `<span class="err">${esc(item.exportErr)}</span>`;
   } finally {
     item.busy = false;
-    if (item.releaseLater) { item.releaseLater = false; release(item); }
-    if (here()) btn.disabled = false;
+    if (here()) { updateExportBtn(); $('ex-barwrap').style.display = 'none'; }
+    else if (item.status === 'done') release(item);   // もう開いていない動画のアップロードは消す
+    renderQueue();
   }
-};
+}
+
+// 裏で続けてダウンロードする（location.href を続けて書き換えると前のが取り消されることがある）
+function download(href) {
+  const a = document.createElement('a');
+  a.href = href; a.download = '';
+  document.body.appendChild(a); a.click(); a.remove();
+}
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }
 </script>
