@@ -306,7 +306,9 @@ function openItem(i) {
   const prev = queue[curIdx], item = queue[i];
   if (prev && prev !== item && (prev.status === 'done' || prev.status === 'skip') && !prev.busy) release(prev);
   curIdx = i;
-  st.file = item; st.id = null; st.coverTime = null; st.coverSrc = null; st.fallback = false; st.hasVideo = true;
+  st.file = item; st.id = null; st.coverTime = null; st.coverSrc = null; st.fallback = false; st.still = false; st.hasVideo = true;
+  still.onload = still.onerror = null; still.removeAttribute('src');
+  stillBusy = false; stillWant = null; stillShown = -1;
   $('b-cover').disabled = false; $('use-cover').checked = wantCover;
   st.duration = 0; st.start = st.end = 0; st.t = 0; st.stopAt = null;
   $('crop').style.display = 'none';
@@ -499,7 +501,7 @@ function renderQueue() {
   if (c) c.scrollIntoView({ block: 'nearest' });
 }
 
-video.addEventListener('loadedmetadata', () => { if (!st.id) initRange(video.duration); updateExportBtn(); });
+video.addEventListener('loadedmetadata', () => { if (!st.id) initRange(video.duration); updateExportBtn(); checkPicture(); });
 video.addEventListener('error', () => { if (st.file) enterFallback(); });
 
 function initRange(d) {
@@ -508,20 +510,72 @@ function initRange(d) {
   syncRange();
 }
 
-// ブラウザが再生できない形式（mkv の一部や avi など）→ サーバのフレームでコマ送り
+// ブラウザが再生できない形式（mkv の一部や avi など）→ サーバのフレームでコマ送り（音も出ない）
 function enterFallback() {
   if (st.fallback) return;
-  st.fallback = true;
-  video.style.display = 'none'; still.style.display = 'block'; $('fallback-note').style.display = 'block';
+  st.fallback = true; st.still = false;
+  video.style.display = 'none'; still.style.display = 'block';
+  $('fallback-note').textContent = 'このブラウザでは再生できない形式なので、コマ送りプレビューにしています（音は聞けません）。';
+  $('fallback-note').style.display = 'block';
   $('b-play').disabled = true;
   if (st.id) showStill(st.t);
 }
-let stillTimer = null;
+
+// 音は出るのに映像が出ない形式（HEVC など）。エラーにならず音だけ再生されるので、こちらから気づく必要がある。
+// 再生・時間はそのまま <video> に任せ、映像のところにだけサーバで切り出した静止画を出す。
+// 気づき方は2つ：開く前にブラウザへ「この形式を再生できるか」を聞く／再生しても映像のフレームが1枚もデコードされない
+const CODEC_PROBE = {
+  hevc: tag => `video/mp4; codecs="${tag === 'hev1' ? 'hev1' : 'hvc1'}.1.6.L153.B0"`,
+  av1: () => 'video/mp4; codecs="av01.0.08M.08"',
+  vp9: () => 'video/webm; codecs="vp9"',
+  h264: () => 'video/mp4; codecs="avc1.640028"',
+};
+function cannotDecode(info) {
+  const f = info && CODEC_PROBE[info.vcodec];
+  return !!f && video.canPlayType(f(info.vtag)) === '';   // 分からない形式は再生してみて判断する
+}
+function checkPicture() {
+  if (st.fallback || st.still || !st.id || !st.hasVideo) return;
+  const item = queue[curIdx];
+  if (!cannotDecode(item && item.info) && !(video.readyState >= 1 && video.videoWidth === 0)) return;
+  enterStill();
+}
+// 再生して音が 1.5 秒進んでも映像のフレームが 0 枚なら、映像はデコードできていない
+let playFrom = 0;
+video.addEventListener('play', () => { playFrom = video.currentTime; });
+video.addEventListener('timeupdate', () => {
+  if (st.still || st.fallback || !st.id || !st.hasVideo || video.paused || video.currentTime < playFrom + 1.5) return;
+  const q = video.getVideoPlaybackQuality && video.getVideoPlaybackQuality();
+  if (q && q.totalVideoFrames === 0) enterStill();
+});
+function enterStill() {
+  st.still = true;
+  video.style.display = 'none'; still.style.display = 'block';
+  $('fallback-note').textContent = 'このブラウザでは映像を再生できない形式（HEVC など）なので、映像は静止画で表示しています'
+    + '（再生中は約1秒ごとに更新。音はそのまま聞けます）。';
+  $('fallback-note').style.display = 'block';
+  showStill(video.currentTime);
+}
+
+// 静止画は「前の1枚が届いてから次を頼む」。ドラッグ中に頼みが溜まらず、最後は必ず最新の時刻になる
+let stillBusy = false, stillWant = null, stillShown = -1;
 function showStill(t) {
   if (!st.id || !st.hasVideo) return;
-  clearTimeout(stillTimer);
-  stillTimer = setTimeout(() => { still.src = `api/frame?id=${st.id}&t=${t.toFixed(2)}&w=960`; }, 120);
+  stillWant = t;
+  if (stillBusy) return;
+  stillBusy = true;
+  const id = st.id, tt = stillWant;
+  stillWant = null; stillShown = tt;
+  still.onload = still.onerror = () => {
+    stillBusy = false;
+    if (stillWant != null && st.id === id) showStill(stillWant);
+  };
+  still.src = `api/frame?id=${id}&t=${tt.toFixed(2)}&w=960`;
 }
+video.addEventListener('seeked', () => { if (st.still) showStill(video.currentTime); });
+video.addEventListener('timeupdate', () => {
+  if (st.still && Math.abs(video.currentTime - stillShown) >= 1) showStill(video.currentTime);
+});
 
 // サーバで解析が済んだ情報を今の動画に反映する
 let wantCover = true;   // 「ジャケットを付ける」の本人の選択（映像なしの動画で外しても次で戻す）
@@ -533,6 +587,7 @@ function applyInfo(r) {
   $('use-cover').checked = r.hasVideo && wantCover;
   $('b-cover').disabled = !r.hasVideo;
   if (st.fallback) showStill(st.t);
+  checkPicture();
   scheduleMeasure();
   updateExportBtn();
 }
@@ -675,14 +730,18 @@ async function pickCover() {
   if (!st.fallback && video.seeking) await new Promise(ok => video.addEventListener('seeked', ok, { once: true }));
   const t = cur();
   const src = document.createElement('canvas');
-  if (!st.fallback && video.videoWidth) {
+  if (!st.fallback && !st.still && video.videoWidth) {
     src.width = video.videoWidth; src.height = video.videoHeight;
     src.getContext('2d').drawImage(video, 0, 0);
   } else if (st.id) {
-    // ブラウザで再生できない形式：サーバで切り出したフレームを使う
+    // ブラウザで映像を再生できない形式（コマ送り・静止画表示）：サーバで切り出したフレームを使う
+    // img.decode() は表示されていないタブだと返ってこないことがあるので onload で待つ
     const img = new Image();
-    img.src = `api/frame?id=${st.id}&t=${t.toFixed(2)}&w=${Math.min(st.vw || 1280, 1600)}`;
-    try { await img.decode(); } catch { return; }
+    const ok = await new Promise(done => {
+      img.onload = () => done(true); img.onerror = () => done(false);
+      img.src = `api/frame?id=${st.id}&t=${t.toFixed(2)}&w=${Math.min(st.vw || 1280, 1600)}`;
+    });
+    if (!ok) return;
     src.width = img.naturalWidth; src.height = img.naturalHeight;
     src.getContext('2d').drawImage(img, 0, 0);
   } else return;

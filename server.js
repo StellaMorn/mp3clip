@@ -72,6 +72,8 @@ async function probe(file) {
     duration: Number(json.format.duration) || 0,
     hasVideo: !!v, hasAudio: !!a,
     width: v ? v.width : 0, height: v ? v.height : 0,
+    // ブラウザがこの映像を再生できるか確かめるのに使う（HEVC は音だけ再生されてエラーにならないため）
+    vcodec: v ? v.codec_name : '', vtag: v ? v.codec_tag_string : '',
   };
 }
 
